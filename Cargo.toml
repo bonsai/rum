@@ -15,5 +15,7 @@ unicode-width = "0.2"
 anyhow = "1.0"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
 chrono = "0.4"
 dirs = "5.0"
+rusqlite = { version = "0.32", features = ["bundled"] }

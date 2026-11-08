@@ -1,10 +1,28 @@
 use crate::buffer::{ClipboardContent, Position, TextBuffer};
-use crate::doc::Document;
+use crate::doc::{derive_title, generate_note_id, Document, FrontMatter};
 use anyhow::Result;
+use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use rusqlite::Connection;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+
+/// 読み込み元。db = chira-ura の SQLite、dir = md/txt ディレクトリ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Source {
+    Dir(PathBuf),
+    Db(PathBuf),
+}
+
+/// DB モードのサイドバーに出すノート
+#[derive(Debug, Clone)]
+pub struct NoteEntry {
+    pub id: String,
+    pub title: String,
+    pub updated_at: i64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -23,9 +41,14 @@ pub struct SearchState {
 }
 
 pub struct App {
+    pub source: Source,
+    /// md ディレクトリ（Source::Dir の実体 / `:md` `:sync` の既定）
     pub root_dir: PathBuf,
     pub files: Vec<PathBuf>,
     pub file_index: usize,
+    /// DB モードのノート一覧（サイドバー）
+    pub notes: Vec<NoteEntry>,
+    pub note_index: usize,
 
     pub doc: Document,
     pub buffer: TextBuffer,
@@ -48,16 +71,24 @@ pub struct App {
 }
 
 impl App {
-    pub fn new<P: AsRef<Path>>(dir: P) -> Result<Self> {
-        let root_dir = dir.as_ref().to_path_buf();
-        if !root_dir.exists() {
-            let _ = fs::create_dir_all(&root_dir);
+    pub fn new(source: Source, md_dir: PathBuf) -> Result<Self> {
+        let root_dir = match &source {
+            Source::Dir(p) => p.clone(),
+            Source::Db(_) => md_dir,
+        };
+        if let Source::Dir(dir) = &source {
+            if !dir.exists() {
+                let _ = fs::create_dir_all(dir);
+            }
         }
 
         let mut app = Self {
-            root_dir: root_dir.clone(),
+            source,
+            root_dir,
             files: Vec::new(),
             file_index: 0,
+            notes: Vec::new(),
+            note_index: 0,
             doc: Document::new_empty(),
             buffer: TextBuffer::new(),
             mode: Mode::Normal,
@@ -73,15 +104,155 @@ impl App {
             viewport_top: 0,
         };
 
-        app.refresh_file_list();
-        if !app.files.is_empty() {
-            app.open_file_at_index(0);
-        } else {
-            // New blank document
-            app.new_note();
-        }
+        app.refresh();
+        app.open_initial();
 
         Ok(app)
+    }
+
+    /// 読み込み元に応じて一覧を取り直す
+    pub fn refresh(&mut self) {
+        if matches!(self.source, Source::Db(_)) {
+            self.refresh_notes();
+        } else {
+            self.refresh_file_list();
+        }
+    }
+
+    fn open_initial(&mut self) {
+        if matches!(self.source, Source::Db(_)) {
+            if !self.notes.is_empty() {
+                self.open_note_at_index(0);
+            } else {
+                self.new_note();
+            }
+        } else if !self.files.is_empty() {
+            self.open_file_at_index(0);
+        } else {
+            self.new_note();
+        }
+    }
+
+    /// DB（~/.chira/ura.db 等）のノート一覧を新しい順に読む
+    pub fn refresh_notes(&mut self) {
+        self.notes.clear();
+        let db_path = match &self.source {
+            Source::Db(p) => Some(p.clone()),
+            _ => None,
+        };
+        if let Some(path) = db_path {
+            match Connection::open(&path) {
+                Ok(conn) => {
+                    let _ = conn.execute(
+                        "CREATE TABLE IF NOT EXISTS notes (\
+                         id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', \
+                         content TEXT NOT NULL DEFAULT '', updatedAt INTEGER NOT NULL DEFAULT 0)",
+                        rusqlite::params![],
+                    );
+                    if let Ok(mut stmt) = conn.prepare(
+                        "SELECT id, title, updatedAt FROM notes ORDER BY updatedAt DESC, id DESC",
+                    ) {
+                        if let Ok(rows) = stmt.query_map(rusqlite::params![], |r| {
+                            Ok(NoteEntry {
+                                id: r.get(0)?,
+                                title: r.get(1)?,
+                                updated_at: r.get(2)?,
+                            })
+                        }) {
+                            for n in rows.flatten() {
+                                self.notes.push(n);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.status_message =
+                        Some(format!("db open failed: {}: {e}", path.display()));
+                }
+            }
+        }
+        if self.note_index >= self.notes.len() {
+            self.note_index = self.notes.len().saturating_sub(1);
+        }
+    }
+
+    /// DB の 1 ノートを開いて本文をバッファに載せる
+    pub fn open_note_at_index(&mut self, idx: usize) {
+        if idx >= self.notes.len() {
+            return;
+        }
+        let entry = self.notes[idx].clone();
+        let db_path = match &self.source {
+            Source::Db(p) => p.clone(),
+            _ => return,
+        };
+        let conn = match Connection::open(&db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.status_message = Some(format!("db open failed: {e}"));
+                return;
+            }
+        };
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM notes WHERE id = ?1",
+                rusqlite::params![&entry.id],
+                |r| r.get(0),
+            )
+            .unwrap_or_default();
+        self.buffer = TextBuffer::from_string(&content);
+        self.doc = Document {
+            path: None,
+            front_matter: Some(FrontMatter {
+                id: entry.id.clone(),
+                title: entry.title.clone(),
+                updated_at: entry.updated_at,
+                extra: BTreeMap::new(),
+            }),
+            body: content,
+            modified: false,
+        };
+        self.note_index = idx;
+        self.viewport_top = 0;
+        self.status_message = Some(format!("\"{}\" opened", entry.title));
+    }
+
+    /// DB モードで保存（upsert）
+    fn save_note(&mut self) -> Result<()> {
+        let now = Utc::now().timestamp_millis();
+        let body = self.doc.body.clone();
+        let fm = self.doc.front_matter.get_or_insert_with(|| FrontMatter {
+            id: generate_note_id(now),
+            title: String::new(),
+            updated_at: now,
+            extra: BTreeMap::new(),
+        });
+        if fm.id.is_empty() {
+            fm.id = generate_note_id(now);
+        }
+        fm.title = derive_title(&body);
+        fm.updated_at = now;
+        let id = fm.id.clone();
+        let title = fm.title.clone();
+
+        let db_path = match &self.source {
+            Source::Db(p) => p.clone(),
+            _ => anyhow::bail!("not in db mode"),
+        };
+        let conn = Connection::open(&db_path)?;
+        conn.execute(
+            "INSERT INTO notes (id, title, content, updatedAt) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(id) DO UPDATE SET title = excluded.title, \
+             content = excluded.content, updatedAt = excluded.updatedAt",
+            rusqlite::params![id, title, body, now],
+        )?;
+        self.doc.modified = false;
+        self.refresh_notes();
+        if let Some(pos) = self.notes.iter().position(|n| n.id == id) {
+            self.note_index = pos;
+        }
+        self.status_message = Some(format!("\"{}\" saved to db", title));
+        Ok(())
     }
 
     pub fn refresh_file_list(&mut self) {
@@ -171,6 +342,22 @@ impl App {
     pub fn save_current_file(&mut self, target_path: Option<&str>) -> Result<()> {
         self.doc.body = self.buffer.to_string();
 
+        if matches!(self.source, Source::Db(_)) {
+            if let Some(p) = target_path {
+                let path_buf = if Path::new(p).is_relative() {
+                    self.root_dir.join(p)
+                } else {
+                    PathBuf::from(p)
+                };
+                let ext = path_buf.extension().and_then(|s| s.to_str()).unwrap_or("");
+                if ext == "md" {
+                    self.doc.ensure_front_matter();
+                }
+                let _ = self.doc.save_to(&path_buf);
+            }
+            return self.save_note();
+        }
+
         if let Some(p) = target_path {
             let path_buf = if Path::new(p).is_relative() {
                 self.root_dir.join(p)
@@ -207,6 +394,14 @@ impl App {
     }
 
     pub fn next_file(&mut self) {
+        if matches!(self.source, Source::Db(_)) {
+            if self.notes.is_empty() {
+                return;
+            }
+            let next_idx = (self.note_index + 1) % self.notes.len();
+            self.open_note_at_index(next_idx);
+            return;
+        }
         if self.files.is_empty() {
             return;
         }
@@ -215,6 +410,18 @@ impl App {
     }
 
     pub fn prev_file(&mut self) {
+        if matches!(self.source, Source::Db(_)) {
+            if self.notes.is_empty() {
+                return;
+            }
+            let prev_idx = if self.note_index == 0 {
+                self.notes.len().saturating_sub(1)
+            } else {
+                self.note_index - 1
+            };
+            self.open_note_at_index(prev_idx);
+            return;
+        }
         if self.files.is_empty() {
             return;
         }
@@ -758,6 +965,40 @@ impl App {
             }
             "prev" => {
                 self.prev_file();
+            }
+            "db" => {
+                if let Some(p) = arg {
+                    let path = crate::config::expand(p);
+                    self.source = Source::Db(path.clone());
+                    self.refresh_notes();
+                    if !self.notes.is_empty() {
+                        self.open_note_at_index(0);
+                    } else {
+                        self.new_note();
+                    }
+                    self.status_message = Some(format!("db -> {}", path.display()));
+                } else {
+                    self.status_message = Some("usage: :db <path>".to_string());
+                }
+            }
+            "dir" => {
+                if let Some(p) = arg {
+                    let path = crate::config::expand(p);
+                    if !path.exists() {
+                        let _ = fs::create_dir_all(&path);
+                    }
+                    self.root_dir = path.clone();
+                    self.source = Source::Dir(path.clone());
+                    self.refresh_file_list();
+                    if !self.files.is_empty() {
+                        self.open_file_at_index(0);
+                    } else {
+                        self.new_note();
+                    }
+                    self.status_message = Some(format!("dir -> {}", path.display()));
+                } else {
+                    self.status_message = Some("usage: :dir <path>".to_string());
+                }
             }
             "md" => {
                 // External `chira md [dir]`

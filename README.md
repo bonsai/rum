@@ -1,17 +1,42 @@
 # rum — vim 風 TUI リーダ/エディタ
 
-`chira-ura` の markdown ディレクトリ（既定 `~/.chira/md`）を開き、vim キーバインドで素早く閲覧・編集・保存する TUI ツール。
-保存は md / txt のみ直接更新し、SQLite DB には触りません（DB への取り込みは `chira md import` / `:sync`）。
+`chira-ura` のメモを vim キーバインドで素早く閲覧・編集・保存する TUI ツール。
+読み込み元は設定（YAML）で選ぶ — SQLite を直接（既定 `~/.chira/ura.db`）か、`chira md` が出す md ディレクトリ。
+どのパスもアプリにハードコードしない。
 
 ## 起動
 
 ```bash
-# 既定ディレクトリ (~/.chira/md) で起動
+# 設定（YAML）の source に従う（既定は db: ~/.chira/ura.db）
 rum
 
-# 指定ディレクトリで起動
+# md/txt ディレクトリを開く
 rum path/to/notes
+
+# chira-ura の DB を直接開く
+rum --db ~/.chira/ura.db
+
+# 設定ファイルを指定
+rum --config ./rum.yaml
 ```
+
+## 設定（rum.yaml）
+
+探索順: `--config <file>` / 環境変数 `RUM_CONFIG` → `./rum.yaml` → `~/.config/rum/config.yaml` → `~/.chira/rum.yaml`
+
+```yaml
+source: db              # db（SQLite）| dir（md/txt）
+db: ~/.chira/ura.db     # source: db で開く SQLite
+dir: ~/.chira/md        # source: dir で開くディレクトリ / :md :sync の既定
+```
+
+`~` は展開される。`rum.example.yaml` を参照。
+
+## 読み込み元の切替
+
+- `:db <path>` — SQLite に切替（chira-ura のメモ。`notes` テーブルを読み書き）
+- `:dir <path>` — md/txt ディレクトリに切替
+- `:md [dir]` / `:sync [dir]` — 外部 `chira md` / `chira md import`
 
 ## 操作早見表
 
@@ -66,8 +91,14 @@ rum path/to/notes
 - `:md [dir]`: 外部コマンド `chira md [dir]` を実行
 - `:sync [dir]`: 外部コマンド `chira md import [dir]` を実行
 
-## Front Matter の仕様
-- front matter（`id` / `title` / `updatedAt`）を持つファイルはフォーマットを維持して保存されます。
-- 保存時、`updatedAt` は現在時刻（ミリ秒）に自動更新されます。
-- `id` が無い場合は自動採番（`note-<timestamp>-<rand4>`）されます。
-- front matter の無いテキストファイルは素テキストのまま保存されます。
+## データの扱い
+
+### DB モード（`source: db`）
+- `notes(id, title, content, updatedAt)` を直接読み書きします（chira-ura と同じスキーマ）。
+- 保存は `updatedAt = 現在時刻（ミリ秒）` で upsert。`id` が無ければ `note-<timestamp>-<rand4>` を採番。
+- サイドバーはノート（新しい順）。`Ctrl-p` / `Ctrl-n` で前後のノート。
+
+### ディレクトリモード（`source: dir`）
+- front matter（`id` / `title` / `updatedAt`）を持つ md はフォーマットを維持して保存。
+- 保存時、`updatedAt` は現在時刻（ミリ秒）に自動更新。`id` が無ければ採番。
+- front matter の無いテキストファイルは素テキストのまま保存。

@@ -1,0 +1,18 @@
+# rum 設定ファイルの例
+#
+# 置き場所（探索順）:
+#   1. --config <file> / 環境変数 RUM_CONFIG
+#   2. ./rum.yaml
+#   3. ~/.config/rum/config.yaml   ← 推奨
+#   4. ~/.chira/rum.yaml
+#
+# パスはここで設定する（アプリにハードコードしない）。`~` は展開される。
+
+# 既定の読み込み元: "db"（SQLite）または "dir"（md/txt ディレクトリ）
+source: db
+
+# source: db のときに開く SQLite（chira-ura のメモ DB）
+db: ~/.chira/ura.db
+
+# source: dir のときに開くディレクトリ（`:md` / `:sync` の既定でもある）
+dir: ~/.chira/md

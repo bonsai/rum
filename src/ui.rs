@@ -1,4 +1,4 @@
-use crate::app::{App, Mode};
+use crate::app::{App, Mode, Source};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -43,17 +43,40 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app
-        .files
+    let (names, selected, title): (Vec<String>, usize, String) = match &app.source {
+        Source::Dir(_) => (
+            app.files
+                .iter()
+                .map(|p| {
+                    p.file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "unnamed".to_string())
+                })
+                .collect(),
+            app.file_index,
+            format!(" Files ({}) ", app.files.len()),
+        ),
+        Source::Db(_) => (
+            app.notes
+                .iter()
+                .map(|n| {
+                    if n.title.trim().is_empty() {
+                        n.id.clone()
+                    } else {
+                        n.title.clone()
+                    }
+                })
+                .collect(),
+            app.note_index,
+            format!(" Notes ({}) ", app.notes.len()),
+        ),
+    };
+
+    let items: Vec<ListItem> = names
         .iter()
         .enumerate()
-        .map(|(i, path)| {
-            let name = path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| "unnamed".to_string());
-
-            let is_selected = i == app.file_index;
+        .map(|(i, name)| {
+            let is_selected = i == selected;
             let style = if is_selected {
                 Style::default()
                     .fg(Color::Yellow)
@@ -66,8 +89,6 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             ListItem::new(format!("{}{}", prefix, name)).style(style)
         })
         .collect();
-
-    let title = format!(" Files ({}) ", app.files.len());
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
@@ -208,6 +229,13 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         .path
         .as_ref()
         .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .or_else(|| {
+            app.doc
+                .front_matter
+                .as_ref()
+                .map(|f| f.title.clone())
+                .filter(|t| !t.is_empty())
+        })
         .unwrap_or_else(|| "[No Name]".to_string());
 
     let mod_flag = if app.doc.modified { " [+]" } else { "" };
