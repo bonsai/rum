@@ -42,6 +42,8 @@ pub struct SearchState {
 
 pub struct App {
     pub source: Source,
+    /// 読み込み元（SQLite / ディレクトリ）
+    pub dir: Option<PathBuf>,
     /// md ディレクトリ（Source::Dir の実体 / `:md` `:sync` の既定）
     pub root_dir: PathBuf,
     pub files: Vec<PathBuf>,
@@ -84,6 +86,7 @@ impl App {
 
         let mut app = Self {
             source,
+            dir: None,
             root_dir,
             files: Vec::new(),
             file_index: 0,
@@ -217,7 +220,7 @@ impl App {
         self.status_message = Some(format!("\"{}\" opened", entry.title));
     }
 
-    /// DB モードで保存（upsert）
+    /// DB モードで保存（upsert）— トランザクション + リトライ付き
     fn save_note(&mut self) -> Result<()> {
         let now = Utc::now().timestamp_millis();
         let body = self.doc.body.clone();
@@ -239,13 +242,46 @@ impl App {
             Source::Db(p) => p.clone(),
             _ => anyhow::bail!("not in db mode"),
         };
-        let conn = Connection::open(&db_path)?;
-        conn.execute(
-            "INSERT INTO notes (id, title, content, updatedAt) VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT(id) DO UPDATE SET title = excluded.title, \
-             content = excluded.content, updatedAt = excluded.updatedAt",
-            rusqlite::params![id, title, body, now],
-        )?;
+
+        // トランザクション + 指数バックオフリトライ
+        let max_retries = 5;
+        let mut retry_count = 0;
+        loop {
+            let conn = Connection::open(&db_path)?;
+            let tx = conn.transaction();
+            match tx {
+                Ok(tx) => {
+                    let result = tx.execute(
+                        "INSERT INTO notes (id, title, content, updatedAt) VALUES (?1, ?2, ?3, ?4) \
+                         ON CONFLICT(id) DO UPDATE SET title = excluded.title, \
+                         content = excluded.content, updatedAt = excluded.updatedAt",
+                        rusqlite::params![id, title, body, now],
+                    );
+                    match result {
+                        Ok(_) => {
+                            tx.commit()?;
+                            break;
+                        }
+                        Err(e) => {
+                            drop(tx);
+                            if retry_count >= max_retries {
+                                return Err(anyhow::anyhow!("save failed after {} retries: {}", retry_count, e));
+                            }
+                            retry_count += 1;
+                            std::thread::sleep(std::time::Duration::from_millis(100 * (1 << retry_count)));
+                        }
+                    }
+                }
+                Err(e) => {
+                    drop(tx);
+                    if retry_count >= max_retries {
+                        return Err(anyhow::anyhow!("db lock after {} retries: {}", retry_count, e));
+                    }
+                    retry_count += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100 * (1 << retry_count)));
+                }
+            }
+        }
         self.doc.modified = false;
         self.refresh_notes();
         if let Some(pos) = self.notes.iter().position(|n| n.id == id) {
