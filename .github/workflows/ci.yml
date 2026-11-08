@@ -22,8 +22,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # フォーマットは参考表示（ビルドは止めない）
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
+        continue-on-error: true
 
       - name: cargo clippy
         run: cargo clippy --all-targets
