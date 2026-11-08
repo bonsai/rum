@@ -368,10 +368,12 @@ impl App {
     }
 
     pub fn new_note(&mut self) {
+        // Ensure front matter for all new files
         let mut doc = Document::new_empty();
         doc.ensure_front_matter();
         self.doc = doc;
         self.buffer = TextBuffer::new();
+        self.doc.modified = true; // New files are considered modified
         self.status_message = Some("New note created".to_string());
     }
 
