@@ -1,78 +1,52 @@
-# Issue Tracker
+# Issue Tracker — rum
 
-## Current Issues
+## Current Issues (Delegated to Jules)
 
-### [ISSUE-001] Chira Command Dependency
-**Problem**: The `:md` and `:sync` commands rely on the external `chira` CLI tool being installed and accessible in PATH. If missing, users get generic "Failed to run chira" errors without guidance.
-**Steps to Reproduce**:
-1. Ensure `chira` is not installed or not in PATH
-2. Run `rum path/to/notes --md`
-3. Observe error: `Failed to run chira: Os { code: 2, kind: NotFound }`
-**Suggested Fix**: 
-- Add pre-check for `chira` existence
-- Provide clear installation instructions in help text
-- Consider bundling minimal chira binary or providing alternative import methods
+| # | GitHub Issue | Title | Status | Jules Order File |
+|---|--------------|-------|--------|------------------|
+| 1 | #1 | feat: 3ペイン + BOX + たて24行の紙 + 裏写り | ✅ Done (20815c8) | rum-007-3pane-layout.md |
+| 2 | #2 | ISSUE-001: Chira Command Dependency | 🟡 Partial (0ef53b0) | rum-001-chira-dependency.md |
+| 3 | #3 | ISSUE-002: SQLite Concurrency Risks | 🟡 In Progress (41a981f) | rum-002-sqlite-concurrency.md |
+| 4 | #4 | ISSUE-005: Command Execution Error Handling Gap | 🟡 Partial (0ef53b0) | rum-005-command-errors.md |
+| 5 | #5 | ISSUE-004: Missing Front Matter on New Text Files | ✅ Fixed (0ccbb4d) | rum-004-front-matter.md |
+| 6 | #6 | ISSUE-003: Configuration Path Expansion Edge Cases | 🔴 Open | rum-003-path-expansion.md |
+| 7 | #7 | ISSUE-006: Undo/Redo State Persistence Across Modes | 🔴 Open | rum-006-undo-redo.md |
 
-### [ISSUE-002] SQLite Concurrency Risks
-**Problem**: Multiple rapid operations on SQLite DB (e.g., quick save/load cycles) may cause database locking without proper transaction handling.
-**Evidence**: 
-- `save_note()` uses simple `Connection::open()` without wrapping in transaction
-- No retry logic for `Database is locked` errors
-**Suggested Fix**: 
-- Wrap DB operations in `rusqlite::Transaction` for atomicity
-- Implement exponential backoff for lock contention
-- Add DB connection pooling for frequent operations
+## Local Fixes Applied (on `issue-creator` branch)
 
-### [ISSUE-003] Configuration Path Expansion Edge Cases
-**Problem**: Tilde (`~`) expansion fails in certain contexts (e.g., Windows paths with backslashes, mixed separators).
-**Evidence**: 
-- `expand("~/dir\\file")` may not resolve correctly on Windows
-- `expand("~\\")` creates invalid paths
-**Suggested Fix**: 
-- Improve `expand()` to handle Windows-specific path quirks
-- Add validation for expanded paths before use
-- Consider using `directories` crate for more robust path resolution
+| Commit | Issue | Description |
+|--------|-------|-------------|
+| 20815c8 | #1 | 3-pane layout — Sidebar (25%) + Editor (50%) + Notes/Memos (25%) |
+| 41a981f | #3 | SQLite concurrency — transactions + exponential backoff retry |
+| 0ccbb4d | #5 | new_note ensures front matter for all files |
+| 0ef53b0 | #2, #4 | chira command error handling — clearer "not found" message |
 
-## Additional Issues Discovered During Code Review
+## Jules Sessions Launched
 
-### [ISSUE-004] Missing Front Matter on New Text Files
-**Problem**: When creating new `.txt` files (non-markdown), front matter is not automatically generated, but the code path might not handle this consistently across all edit scenarios.
-**Evidence**: 
-- `new_note()` calls `ensure_front_matter()`, which only works for markdown files per `ensure_front_matter()` logic
-- `.txt` files saved without front matter may lose structural metadata when re-opened
-**Suggested Fix**: 
-- Ensure all new files get appropriate metadata initialization
-- Consider automatic front matter generation for all file types or explicit user opt-in
+All 7 issues have Jules sessions running (launched via `mcp__jules_cli__jules_launch`):
 
-### [ISSUE-005] Command Execution Error Handling Gap
-**Problem**: The `execute_command` method has inconsistent error reporting - some commands update `status_message` while others silently fail or produce terminal output only.
-**Evidence**: 
-- `:w` (save) updates status on success/failure
-- `:q` shows message only if modified, otherwise sets `should_quit`
-- `:db` and `:dir` show usage message if arg missing, but don't prevent mode switch
-- Some error paths don't restore normal mode properly
-**Suggested Fix**: 
-- Standardize error handling pattern across all commands
-- Ensure mode always returns to Normal on error or completion
-- Add validation before mode transitions
+- rum-001-chira-dependency.md → issue 1
+- rum-002-sqlite-concurrency.md → issue 2
+- rum-003-path-expansion.md → issue 3
+- rum-004-front-matter.md → issue 4
+- rum-005-command-errors.md → issue 5
+- rum-006-undo-redo.md → issue 6
+- rum-007-3pane-layout.md → issue 7
 
-### [ISSUE-006] Undo/Redo State Persistence Across Modes
-**Problem**: The undo/redo stack doesn't properly persist or reset when switching between Normal, Insert, and Visual modes, potentially causing unexpected state.
-**Evidence**: 
-- `TextBuffer::undo()` and `redo()` operate on `history` and `redo_stack`
-- Mode changes don't trigger stack clearing or preservation
-- User might expect undo history to be mode-specific or global
-**Suggested Fix**: 
-- Clarify undo/redo semantics in documentation
-- Add mode-aware history management if needed
-- Consider user expectations for cross-mode state
+## Dependency Graph
 
-## Proposed Next Steps
-1. Address Issue-001 by enhancing command error messages
-2. Implement transaction safety in SQLite operations (Issue-002)
-3. Refactor path expansion logic (Issue-003)
-4. Fix front matter handling for text files (Issue-004)
-5. Standardize command error handling (Issue-005)
-6. Review undo/redo cross-mode behavior (Issue-006)
+```
+#3 SQLite Concurrency ──→ #4 Command Errors ──→ #1 3-Pane Layout
+#6 Path Expansion ──→ #5 Front Matter ──→ #1 3-Pane Layout
+#2 Chira Dependency ──→ #4 Command Errors
+#7 Undo/Redo ──→ #1 3-Pane Layout
+```
 
-Let's start with Issue-001 - the most user-visible problem.
+**Critical Path**: #3 → #6 → #5 → #4 → #1
+
+## Next Steps
+
+1. Monitor Jules session progress via `gh run list --branch issue-creator`
+2. Review Jules patches when complete
+3. Apply and test patches locally
+4. Merge to main when all issues resolved

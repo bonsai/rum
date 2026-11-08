@@ -3,3 +3,4 @@
 **/*.rs.bk
 /dist
 Cargo.lock
+.jules/
