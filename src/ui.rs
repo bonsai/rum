@@ -27,19 +27,75 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let status_area = chunks[1];
     let command_area = chunks[2];
 
-    // Split main_area horizontally: Sidebar (22%) and Editor (78%)
+    // Split main_area into 3 panes: Sidebar (25%), Editor (50%), Notes/Memos (25%)
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(22), Constraint::Percentage(78)])
+        .constraints([Constraint::Percentage(25), Constraint::Percentage(50), Constraint::Percentage(25)])
         .split(main_area);
 
     let sidebar_area = h_chunks[0];
     let editor_area = h_chunks[1];
+    let notes_area = h_chunks[2];
 
     render_sidebar(frame, app, sidebar_area);
     render_editor(frame, app, editor_area);
+    render_notes(frame, app, notes_area);
     render_status(frame, app, status_area);
     render_command(frame, app, command_area);
+}
+
+fn render_notes(frame: &mut Frame, app: &App, area: Rect) {
+    let title = match &app.source {
+        Source::Db(_) => format!(" Notes ({}) ", app.notes.len()),
+        Source::Dir(_) => format!(" Memos ({}) ", app.files.len()),
+    };
+
+    let items: Vec<ListItem> = match &app.source {
+        Source::Db(_) => app
+            .notes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let is_selected = i == app.note_index;
+                let style = if is_selected {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let name = if n.title.trim().is_empty() { n.id.clone() } else { n.title.clone() };
+                ListItem::new(format!("{}{}", if is_selected { "▶ " } else { "  " }, name))
+                    .style(style)
+            })
+            .collect(),
+        Source::Dir(_) => app
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let is_selected = i == app.file_index;
+                let style = if is_selected {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let name = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unnamed".to_string());
+                ListItem::new(format!("{}{}", if is_selected { "▶ " } else { "  " }, name))
+                    .style(style)
+            })
+            .collect(),
+    };
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(Color::Green)),
+    );
+
+    frame.render_widget(list, area);
 }
 
 fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
