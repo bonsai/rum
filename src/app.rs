@@ -1038,48 +1038,34 @@ impl App {
                     self.status_message = Some("usage: :dir <path>".to_string());
                 }
             }
-            "md" => {
-                // External `chira md [dir]`
+            "md" | "sync" => {
+                let import = cmd == "sync";
                 let target_dir = arg.unwrap_or(self.root_dir.to_str().unwrap_or(""));
-                self.status_message = Some(format!("Running chira md {}...", target_dir));
-                let output = ProcessCommand::new("chira")
-                    .arg("md")
-                    .arg(target_dir)
-                    .output();
-                match output {
+                
+                let action = if import { "md import" } else { "md" };
+                self.status_message = Some(format!("Running chira {} {}...", action, target_dir));
+                let mut proc = ProcessCommand::new("chira");
+                proc.arg("md");
+                if import {
+                    proc.arg("import");
+                }
+                proc.arg(target_dir);
+                
+                match proc.output() {
                     Ok(out) => {
                         self.refresh_file_list();
                         if out.status.success() {
-                            self.status_message = Some("chira md completed".to_string());
+                            self.status_message = Some(format!("chira {} completed", action));
                         } else {
                             let err_msg = String::from_utf8_lossy(&out.stderr);
                             self.status_message =
-                                Some(format!("chira md failed: {}", err_msg.trim()));
+                                Some(format!("chira {} failed: {}", action, err_msg.trim()));
                         }
                     }
-                    Err(e) => {
-                        self.status_message = Some(format!("Failed to run chira: {}", e));
-                    }
-                }
-            }
-            "sync" => {
-                // External `chira md import [dir]`
-                let target_dir = arg.unwrap_or(self.root_dir.to_str().unwrap_or(""));
-                self.status_message = Some(format!("Running chira md import {}...", target_dir));
-                let output = ProcessCommand::new("chira")
-                    .arg("md")
-                    .arg("import")
-                    .arg(target_dir)
-                    .output();
-                match output {
-                    Ok(out) => {
-                        if out.status.success() {
-                            self.status_message = Some("chira md import completed".to_string());
-                        } else {
-                            let err_msg = String::from_utf8_lossy(&out.stderr);
-                            self.status_message =
-                                Some(format!("chira md import failed: {}", err_msg.trim()));
-                        }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        self.status_message = Some(
+                            "chira not found in PATH. Install: cargo install chira-ura".to_string(),
+                        );
                     }
                     Err(e) => {
                         self.status_message = Some(format!("Failed to run chira: {}", e));
