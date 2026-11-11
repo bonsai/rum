@@ -9,6 +9,33 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
+pub const CHIRA_NOT_FOUND_MSG: &str =
+    "chira CLI is not installed or not in PATH. Install with: cargo install chira-ura";
+
+/// Checks if the `chira` binary is available in PATH.
+pub fn is_chira_available() -> bool {
+    let path_var = match std::env::var_os("PATH") {
+        Some(val) => val,
+        None => return false,
+    };
+
+    #[cfg(windows)]
+    let exe_names = ["chira.exe", "chira.cmd", "chira.bat", "chira"];
+    #[cfg(not(windows))]
+    let exe_names = ["chira"];
+
+    for dir in std::env::split_paths(&path_var) {
+        for name in &exe_names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// 読み込み元。db = chira-ura の SQLite、dir = md/txt ディレクトリ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -1009,6 +1036,10 @@ impl App {
             }
             "md" => {
                 // External `chira md [dir]`
+                if !is_chira_available() {
+                    self.status_message = Some(CHIRA_NOT_FOUND_MSG.to_string());
+                    return;
+                }
                 let target_dir = arg.unwrap_or(self.root_dir.to_str().unwrap_or(""));
                 self.status_message = Some(format!("Running chira md {}...", target_dir));
                 let output = ProcessCommand::new("chira")
@@ -1027,12 +1058,20 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        self.status_message = Some(format!("Failed to run chira: {}", e));
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            self.status_message = Some(CHIRA_NOT_FOUND_MSG.to_string());
+                        } else {
+                            self.status_message = Some(format!("Failed to run chira: {}", e));
+                        }
                     }
                 }
             }
             "sync" => {
                 // External `chira md import [dir]`
+                if !is_chira_available() {
+                    self.status_message = Some(CHIRA_NOT_FOUND_MSG.to_string());
+                    return;
+                }
                 let target_dir = arg.unwrap_or(self.root_dir.to_str().unwrap_or(""));
                 self.status_message = Some(format!("Running chira md import {}...", target_dir));
                 let output = ProcessCommand::new("chira")
@@ -1051,7 +1090,11 @@ impl App {
                         }
                     }
                     Err(e) => {
-                        self.status_message = Some(format!("Failed to run chira: {}", e));
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            self.status_message = Some(CHIRA_NOT_FOUND_MSG.to_string());
+                        } else {
+                            self.status_message = Some(format!("Failed to run chira: {}", e));
+                        }
                     }
                 }
             }
@@ -1059,5 +1102,72 @@ impl App {
                 self.status_message = Some(format!("Unknown command: {}", cmd));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_chira_available_returns_false_when_not_in_path() {
+        let original_path = std::env::var_os("PATH");
+        let temp_empty_dir = std::env::temp_dir().join("rum_empty_path_test");
+        let _ = fs::create_dir_all(&temp_empty_dir);
+
+        std::env::set_var("PATH", &temp_empty_dir);
+        let available = is_chira_available();
+        if let Some(orig) = original_path {
+            std::env::set_var("PATH", orig);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        let _ = fs::remove_dir(&temp_empty_dir);
+
+        assert!(!available);
+    }
+
+    #[test]
+    fn test_execute_command_md_missing_chira() {
+        let original_path = std::env::var_os("PATH");
+        let temp_empty_dir = std::env::temp_dir().join("rum_empty_path_md_test");
+        let _ = fs::create_dir_all(&temp_empty_dir);
+
+        std::env::set_var("PATH", &temp_empty_dir);
+
+        let mut app = App::new(Source::Dir(temp_empty_dir.clone()), temp_empty_dir.clone())
+            .expect("app init");
+        app.execute_command("md");
+
+        if let Some(orig) = original_path {
+            std::env::set_var("PATH", orig);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        let _ = fs::remove_dir_all(&temp_empty_dir);
+
+        assert_eq!(app.status_message, Some(CHIRA_NOT_FOUND_MSG.to_string()));
+    }
+
+    #[test]
+    fn test_execute_command_sync_missing_chira() {
+        let original_path = std::env::var_os("PATH");
+        let temp_empty_dir = std::env::temp_dir().join("rum_empty_path_sync_test");
+        let _ = fs::create_dir_all(&temp_empty_dir);
+
+        std::env::set_var("PATH", &temp_empty_dir);
+
+        let mut app = App::new(Source::Dir(temp_empty_dir.clone()), temp_empty_dir.clone())
+            .expect("app init");
+        app.execute_command("sync");
+
+        if let Some(orig) = original_path {
+            std::env::set_var("PATH", orig);
+        } else {
+            std::env::remove_var("PATH");
+        }
+        let _ = fs::remove_dir_all(&temp_empty_dir);
+
+        assert_eq!(app.status_message, Some(CHIRA_NOT_FOUND_MSG.to_string()));
     }
 }

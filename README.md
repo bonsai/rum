@@ -36,7 +36,7 @@ dir: ~/.chira/md        # source: dir で開くディレクトリ / :md :sync �
 
 - `:db <path>` — SQLite に切替（chira-ura のメモ。`notes` テーブルを読み書き）
 - `:dir <path>` — md/txt ディレクトリに切替
-- `:md [dir]` / `:sync [dir]` — 外部 `chira md` / `chira md import`
+- `:md [dir]` / `:sync [dir]` — 外部 `chira md` / `chira md import`（外部 CLI `chira` が必要です: `cargo install chira-ura`）
 
 ## 操作早見表
 
@@ -88,8 +88,8 @@ dir: ~/.chira/md        # source: dir で開くディレクトリ / :md :sync �
 - `:new`: 新規メモ作成
 - `:next`: 次のファイルを開く
 - `:prev`: 前のファイルを開く
-- `:md [dir]`: 外部コマンド `chira md [dir]` を実行
-- `:sync [dir]`: 外部コマンド `chira md import [dir]` を実行
+- `:md [dir]`: 外部コマンド `chira md [dir]` を実行（要 `cargo install chira-ura`）
+- `:sync [dir]`: 外部コマンド `chira md import [dir]` を実行（要 `cargo install chira-ura`）
 
 ## データの扱い
 
