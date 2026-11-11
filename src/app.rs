@@ -1206,6 +1206,9 @@ mod tests {
         app.buffer = TextBuffer::from_string("# First Note\nBody 1");
         app.save_current_file(None).unwrap();
 
+        // Ensure distinct millisecond timestamp for generated note ID
+        thread::sleep(Duration::from_millis(10));
+
         app.new_note();
         app.buffer = TextBuffer::from_string("# Second Note\nBody 2");
         app.save_current_file(None).unwrap();
