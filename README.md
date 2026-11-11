@@ -25,18 +25,24 @@ rum --config ./rum.yaml
 探索順: `--config <file>` / 環境変数 `RUM_CONFIG` → `./rum.yaml` → `~/.config/rum/config.yaml` → `~/.chira/rum.yaml`
 
 ```yaml
-source: db              # db（SQLite）| dir（md/txt）
-db: ~/.chira/ura.db     # source: db で開く SQLite
-dir: ~/.chira/md        # source: dir で開くディレクトリ / :md :sync の既定
+boxes:
+  - name: メモ
+    source: db
+    db: ~/.chira/ura.db
+  - name: 下書き
+    source: dir
+    dir: ~/.chira/md
 ```
 
-`~` は展開される。`rum.example.yaml` を参照。
+単一の `source`, `db`, `dir` も後方互換で動作します。
+`~` は展開されます。`rum.example.yaml` を参照。
 
-## 読み込み元の切替
+## 3ペイン + チラ裏メタファ
 
-- `:db <path>` — SQLite に切替（chira-ura のメモ。`notes` テーブルを読み書き）
-- `:dir <path>` — md/txt ディレクトリに切替
-- `:md [dir]` / `:sync [dir]` — 外部 `chira md` / `chira md import`
+- **BOX**: 箱（ノートブック）の一覧。箱 = 読み込み元（SQLite / ディレクトリ）。
+- **紙（シート）**: 選択中 BOX の紙一覧。1 枚 = 1 ノート。
+- **エディタ**: 紙の本文。1 枚は **たて 24 行固定**（25 行目は入力不可）。溢れたら新しい紙に続きを書く。
+- **裏写り**: おもて面の文字が裏からうっすら透ける演出（空行に直前の紙の行が淡く重なる）。既定 ON、`:set ura` / `:set noura` でトグル可能。
 
 ## 操作早見表
 
@@ -47,6 +53,14 @@ dir: ~/.chira/md        # source: dir で開くディレクトリ / :md :sync �
 - `Command`: `:` でコマンド入力
 - `Search`: `/` で検索入力
 
+### ペイン・リスト操作
+- `Tab` / `Shift-Tab`: ペイン移動（BOX ↔ 紙 ↔ エディタ）
+- `↑` / `↓`（十字）または `j` / `k`: リスト選択 / エディタの行移動
+- `n`: フォーカス中ペインで新規作成
+  - BOX ペイン → 箱を新規（`:box <name> <db|dir> <path>`）
+  - 紙ペイン → 紙を新規
+- `Ctrl-n` / `Ctrl-p`（または `]s` / `[s`）: 次の紙 / 前の紙
+
 ### 移動（Normal / Visual）
 - `h`, `j`, `k`, `l`: 左 / 下 / 上 / 右
 - `w`: 次の単語先頭
@@ -55,8 +69,8 @@ dir: ~/.chira/md        # source: dir で開くディレクトリ / :md :sync �
 - `$`: 行末
 - `gg`: 先頭行
 - `G`: 最終行
-- `Ctrl-p`: 前のファイル
-- `Ctrl-n`: 次のファイル
+- `Ctrl-p`: 前の紙
+- `Ctrl-n`: 次の紙
 
 ### 編集（Normal）
 - `i`: カーソル位置で Insert モード
@@ -85,9 +99,10 @@ dir: ~/.chira/md        # source: dir で開くディレクトリ / :md :sync �
 - `:wq` / `:x`: 保存して終了
 - `:e <path>`: 指定ファイルを開く
 - `:e! [path]`: 現在のファイルまたは指定ファイルを再読み込み（変更破棄）
-- `:new`: 新規メモ作成
-- `:next`: 次のファイルを開く
-- `:prev`: 前のファイルを開く
+- `:new`: 新規紙作成
+- `:next` / `:prev`: 次/前の紙を開く
+- `:set ura` / `:set noura`: 裏写り演出の有効化 / 無効化
+- `:box <name> <db|dir> <path>`: 新規 BOX の追加・設定保存
 - `:md [dir]`: 外部コマンド `chira md [dir]` を実行
 - `:sync [dir]`: 外部コマンド `chira md import [dir]` を実行
 

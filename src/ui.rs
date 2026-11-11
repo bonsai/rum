@@ -1,4 +1,5 @@
-use crate::app::{App, Mode, Source};
+use crate::app::{App, Mode, Pane, Source};
+use crate::buffer::MAX_SHEET_LINES;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -11,7 +12,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
 
     // Vertical layout:
-    // 0: Main editor area (Sidebar + Editor)
+    // 0: Main 3-pane area (BOX + 紙 + エディタ)
     // 1: Status line (1 row)
     // 2: Command/Search/Echo line (1 row)
     let chunks = Layout::default()
@@ -27,23 +28,85 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let status_area = chunks[1];
     let command_area = chunks[2];
 
-    // Split main_area horizontally: Sidebar (22%) and Editor (78%)
+    // Split main_area horizontally into 3 panes:
+    // BOX (18%), 紙/シート (24%), エディタ (58%)
     let h_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(22), Constraint::Percentage(78)])
+        .constraints([
+            Constraint::Percentage(18),
+            Constraint::Percentage(24),
+            Constraint::Percentage(58),
+        ])
         .split(main_area);
 
-    let sidebar_area = h_chunks[0];
-    let editor_area = h_chunks[1];
+    let box_area = h_chunks[0];
+    let sheet_area = h_chunks[1];
+    let editor_area = h_chunks[2];
 
-    render_sidebar(frame, app, sidebar_area);
+    render_box_pane(frame, app, box_area);
+    render_sheet_pane(frame, app, sheet_area);
     render_editor(frame, app, editor_area);
     render_status(frame, app, status_area);
     render_command(frame, app, command_area);
 }
 
-fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
-    let (names, selected, title): (Vec<String>, usize, String) = match &app.source {
+fn render_box_pane(frame: &mut Frame, app: &App, area: Rect) {
+    let is_focused = app.focused_pane == Pane::Box;
+    let border_color = if is_focused {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
+
+    let items: Vec<ListItem> = app
+        .boxes
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let is_selected = i == app.box_index;
+            let style = if is_selected {
+                Style::default()
+                    .fg(if is_focused {
+                        Color::Yellow
+                    } else {
+                        Color::Cyan
+                    })
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            let prefix = if is_selected { "▶ " } else { "  " };
+            let tag = format!("[{}] ", b.source);
+            ListItem::new(format!("{}{}{}", prefix, tag, b.name)).style(style)
+        })
+        .collect();
+
+    let title = if is_focused {
+        format!(" [BOX ({})] ", app.boxes.len())
+    } else {
+        format!(" BOX ({}) ", app.boxes.len())
+    };
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(border_color)),
+    );
+
+    frame.render_widget(list, area);
+}
+
+fn render_sheet_pane(frame: &mut Frame, app: &App, area: Rect) {
+    let is_focused = app.focused_pane == Pane::Sheet;
+    let border_color = if is_focused {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
+
+    let (names, selected, count_str): (Vec<String>, usize, String) = match &app.source {
         Source::Dir(_) => (
             app.files
                 .iter()
@@ -54,7 +117,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 })
                 .collect(),
             app.file_index,
-            format!(" Files ({}) ", app.files.len()),
+            format!("{}", app.files.len()),
         ),
         Source::Db(_) => (
             app.notes
@@ -68,7 +131,7 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                 })
                 .collect(),
             app.note_index,
-            format!(" Notes ({}) ", app.notes.len()),
+            format!("{}", app.notes.len()),
         ),
     };
 
@@ -79,7 +142,11 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             let is_selected = i == selected;
             let style = if is_selected {
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(if is_focused {
+                        Color::Yellow
+                    } else {
+                        Color::Cyan
+                    })
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
@@ -89,20 +156,55 @@ fn render_sidebar(frame: &mut Frame, app: &App, area: Rect) {
             ListItem::new(format!("{}{}", prefix, name)).style(style)
         })
         .collect();
+
+    let title = if is_focused {
+        format!(" [紙 ({})] ", count_str)
+    } else {
+        format!(" 紙 ({}) ", count_str)
+    };
+
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
             .title(title)
-            .border_style(Style::default().fg(Color::Cyan)),
+            .border_style(Style::default().fg(border_color)),
     );
 
     frame.render_widget(list, area);
 }
 
 fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
+    let is_focused = app.focused_pane == Pane::Editor;
+    let border_color = if is_focused {
+        Color::Yellow
+    } else {
+        Color::Blue
+    };
+
+    let title = if is_focused {
+        format!(
+            " [エディタ (24行の紙{})] ",
+            if app.ura_enabled {
+                " / 裏写り:ON"
+            } else {
+                ""
+            }
+        )
+    } else {
+        format!(
+            " エディタ (24行の紙{}) ",
+            if app.ura_enabled {
+                " / 裏写り:ON"
+            } else {
+                ""
+            }
+        )
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Blue));
+        .title(title)
+        .border_style(Style::default().fg(border_color));
     let inner_area = block.inner(area);
     frame.render_widget(block, area);
 
@@ -111,7 +213,7 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let line_count = app.buffer.line_count();
-    let line_num_width = format!("{}", line_count.max(1)).len() + 1;
+    let line_num_width = 3; // 行番号 1..24
 
     // Adjust viewport vertical scroll
     let cursor_row = app.buffer.cursor.row;
@@ -140,57 +242,98 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
 
     for row_idx in 0..visible_rows {
         let actual_row = app.viewport_top + row_idx;
-        if actual_row < line_count {
-            let line_text = &app.buffer.lines[actual_row];
-            let num_str = format!("{:>width$} ", actual_row + 1, width = line_num_width - 1);
+        if actual_row < MAX_SHEET_LINES {
+            let num_str = format!("{:>2} ", actual_row + 1);
 
             let mut spans = vec![Span::styled(num_str, Style::default().fg(Color::DarkGray))];
 
-            // Colorize visual selection or search matches
-            if let Some((v_start, v_end)) = visual_range {
-                if actual_row >= v_start.row && actual_row <= v_end.row {
-                    let chars: Vec<char> = line_text.chars().collect();
-                    let sel_start = if actual_row == v_start.row {
-                        v_start.col
-                    } else {
-                        0
-                    };
-                    let sel_end = if actual_row == v_end.row {
-                        v_end.col
-                    } else {
-                        chars.len().saturating_sub(1)
-                    };
+            if actual_row < line_count {
+                let line_text = &app.buffer.lines[actual_row];
 
-                    let before: String = chars[..sel_start.min(chars.len())].iter().collect();
-                    let selected: String = if sel_start <= sel_end && sel_start < chars.len() {
-                        chars[sel_start..=sel_end.min(chars.len() - 1)]
-                            .iter()
-                            .collect()
-                    } else {
-                        String::new()
-                    };
-                    let after: String = if sel_end + 1 < chars.len() {
-                        chars[sel_end + 1..].iter().collect()
-                    } else {
-                        String::new()
-                    };
+                // Check for bleed-through (裏写り):
+                // 「現在の紙の空行にだけ、直前の紙（前の面）の行を淡く重ねる。入力の邪魔をしない（非空行には出さない）」
+                let is_empty_line = line_text.trim().is_empty();
+                let bleed_through = if app.ura_enabled && is_empty_line {
+                    app.prev_doc_lines
+                        .as_ref()
+                        .and_then(|lines| lines.get(actual_row))
+                        .filter(|s| !s.trim().is_empty())
+                } else {
+                    None
+                };
 
-                    spans.push(Span::raw(before));
+                if let Some(bleed_text) = bleed_through {
+                    // うっすら透ける淡い演出（DarkGray / Faint）
                     spans.push(Span::styled(
-                        selected,
-                        Style::default().bg(Color::DarkGray).fg(Color::White),
+                        bleed_text.clone(),
+                        Style::default()
+                            .fg(Color::Rgb(80, 80, 80))
+                            .add_modifier(Modifier::DIM),
                     ));
-                    spans.push(Span::raw(after));
+                } else if let Some((v_start, v_end)) = visual_range {
+                    // Visual selection
+                    if actual_row >= v_start.row && actual_row <= v_end.row {
+                        let chars: Vec<char> = line_text.chars().collect();
+                        let sel_start = if actual_row == v_start.row {
+                            v_start.col
+                        } else {
+                            0
+                        };
+                        let sel_end = if actual_row == v_end.row {
+                            v_end.col
+                        } else {
+                            chars.len().saturating_sub(1)
+                        };
+
+                        let before: String = chars[..sel_start.min(chars.len())].iter().collect();
+                        let selected: String = if sel_start <= sel_end && sel_start < chars.len() {
+                            chars[sel_start..=sel_end.min(chars.len() - 1)]
+                                .iter()
+                                .collect()
+                        } else {
+                            String::new()
+                        };
+                        let after: String = if sel_end + 1 < chars.len() {
+                            chars[sel_end + 1..].iter().collect()
+                        } else {
+                            String::new()
+                        };
+
+                        spans.push(Span::raw(before));
+                        spans.push(Span::styled(
+                            selected,
+                            Style::default().bg(Color::DarkGray).fg(Color::White),
+                        ));
+                        spans.push(Span::raw(after));
+                    } else {
+                        spans.push(Span::raw(line_text.clone()));
+                    }
                 } else {
                     spans.push(Span::raw(line_text.clone()));
                 }
             } else {
-                spans.push(Span::raw(line_text.clone()));
+                // Within 24 lines of sheet, but empty after current buffer lines
+                let bleed_through = if app.ura_enabled {
+                    app.prev_doc_lines
+                        .as_ref()
+                        .and_then(|lines| lines.get(actual_row))
+                        .filter(|s| !s.trim().is_empty())
+                } else {
+                    None
+                };
+                if let Some(bleed_text) = bleed_through {
+                    spans.push(Span::styled(
+                        bleed_text.clone(),
+                        Style::default()
+                            .fg(Color::Rgb(80, 80, 80))
+                            .add_modifier(Modifier::DIM),
+                    ));
+                }
             }
 
             lines_to_render.push(Line::from(spans));
         } else {
-            // Tilde for lines past EOF
+            // Lines past 24: sheet boundary, show ~
             lines_to_render.push(Line::from(vec![Span::styled(
                 "~",
                 Style::default().fg(Color::DarkGray),
@@ -202,7 +345,9 @@ fn render_editor(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(paragraph, inner_area);
 
     // Set cursor position in editor
-    if app.mode == Mode::Normal || app.mode == Mode::Insert || app.mode == Mode::Visual {
+    if is_focused
+        && (app.mode == Mode::Normal || app.mode == Mode::Insert || app.mode == Mode::Visual)
+    {
         let cursor_screen_y = inner_area.y + (cursor_row - app.viewport_top) as u16;
         let visual_col = app.buffer.visual_col(4);
         let cursor_screen_x = inner_area.x + line_num_width as u16 + visual_col as u16;
@@ -257,7 +402,17 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
         String::new()
     };
 
-    let left = format!(" {} {}{}{}", mode_str, file_name, mod_flag, fm_info);
+    let box_info = app
+        .boxes
+        .get(app.box_index)
+        .map(|b| format!(" [{}]", b.name))
+        .unwrap_or_default();
+    let ura_info = if app.ura_enabled { " [ura]" } else { "" };
+
+    let left = format!(
+        " {} {}{}{}{}{}",
+        mode_str, file_name, mod_flag, box_info, ura_info, fm_info
+    );
 
     let spaces = area
         .width

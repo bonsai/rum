@@ -151,7 +151,7 @@ fn main() -> Result<()> {
     };
 
     let md_dir: PathBuf = cfg.dir_path();
-    let mut app = App::new(source, md_dir)?;
+    let mut app = App::new_with_config(cfg, source, md_dir)?;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();

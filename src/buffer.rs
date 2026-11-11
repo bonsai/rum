@@ -1,5 +1,8 @@
 use unicode_width::UnicodeWidthChar;
 
+/// 1枚の紙はたて24行固定
+pub const MAX_SHEET_LINES: usize = 24;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
     pub row: usize,
@@ -46,8 +49,11 @@ impl TextBuffer {
 
     pub fn from_string(text: &str) -> Self {
         let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
-        if lines.is_empty() || text.ends_with('\n') {
+        if lines.is_empty() || (text.ends_with('\n') && lines.len() < MAX_SHEET_LINES) {
             lines.push(String::new());
+        }
+        if lines.len() > MAX_SHEET_LINES {
+            lines.truncate(MAX_SHEET_LINES);
         }
         Self {
             lines,
@@ -321,6 +327,10 @@ impl TextBuffer {
     }
 
     pub fn insert_newline(&mut self) {
+        // 1 枚 = たて 24 行。25 行目は入力できない（改行を無視）。
+        if self.lines.len() >= MAX_SHEET_LINES {
+            return;
+        }
         let line = &self.lines[self.cursor.row];
         let chars: Vec<char> = line.chars().collect();
         let col = self.cursor.col.min(chars.len());
@@ -393,12 +403,16 @@ impl TextBuffer {
     pub fn paste(&mut self, clip: &ClipboardContent) {
         match clip {
             ClipboardContent::Lines(lines) => {
-                // Paste below current line
-                for (i, line) in lines.iter().enumerate() {
+                // Paste below current line, respecting MAX_SHEET_LINES
+                let available = MAX_SHEET_LINES.saturating_sub(self.lines.len());
+                let to_insert = lines.len().min(available);
+                for (i, line) in lines.iter().take(to_insert).enumerate() {
                     self.lines.insert(self.cursor.row + 1 + i, line.clone());
                 }
-                self.cursor.row += 1;
-                self.cursor.col = 0;
+                if to_insert > 0 {
+                    self.cursor.row += 1;
+                    self.cursor.col = 0;
+                }
             }
             ClipboardContent::Chars(text) => {
                 let line = &mut self.lines[self.cursor.row];
@@ -419,12 +433,18 @@ impl TextBuffer {
     }
 
     pub fn open_line_below(&mut self) {
+        if self.lines.len() >= MAX_SHEET_LINES {
+            return;
+        }
         self.lines.insert(self.cursor.row + 1, String::new());
         self.cursor.row += 1;
         self.cursor.col = 0;
     }
 
     pub fn open_line_above(&mut self) {
+        if self.lines.len() >= MAX_SHEET_LINES {
+            return;
+        }
         self.lines.insert(self.cursor.row, String::new());
         self.cursor.col = 0;
     }
@@ -503,5 +523,30 @@ mod tests {
 
         buf.paste(&ClipboardContent::Lines(vec![deleted]));
         assert_eq!(buf.lines, vec!["line 2", "line 1", "line 3"]);
+    }
+
+    #[test]
+    fn test_24_lines_limit() {
+        let mut lines = Vec::new();
+        for i in 0..24 {
+            lines.push(format!("line {}", i));
+        }
+        let full_text = lines.join("\n");
+        let mut buf = TextBuffer::from_string(&full_text);
+        assert_eq!(buf.line_count(), 24);
+
+        // 25行目の newline は無視される
+        buf.insert_newline();
+        assert_eq!(buf.line_count(), 24);
+
+        // open_line_below / open_line_above も無視される
+        buf.open_line_below();
+        assert_eq!(buf.line_count(), 24);
+        buf.open_line_above();
+        assert_eq!(buf.line_count(), 24);
+
+        // paste も 24 行を超えない
+        buf.paste(&ClipboardContent::Lines(vec!["extra".to_string()]));
+        assert_eq!(buf.line_count(), 24);
     }
 }
