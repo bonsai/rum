@@ -166,8 +166,7 @@ impl App {
                     }
                 }
                 Err(e) => {
-                    self.status_message =
-                        Some(format!("db open failed: {}: {e}", path.display()));
+                    self.status_message = Some(format!("db open failed: {}: {e}", path.display()));
                 }
             }
         }
@@ -969,14 +968,18 @@ impl App {
             "db" => {
                 if let Some(p) = arg {
                     let path = crate::config::expand(p);
-                    self.source = Source::Db(path.clone());
-                    self.refresh_notes();
-                    if !self.notes.is_empty() {
-                        self.open_note_at_index(0);
+                    if !crate::config::validate_path(&path) {
+                        self.status_message = Some(format!("Invalid path: {}", p));
                     } else {
-                        self.new_note();
+                        self.source = Source::Db(path.clone());
+                        self.refresh_notes();
+                        if !self.notes.is_empty() {
+                            self.open_note_at_index(0);
+                        } else {
+                            self.new_note();
+                        }
+                        self.status_message = Some(format!("db -> {}", path.display()));
                     }
-                    self.status_message = Some(format!("db -> {}", path.display()));
                 } else {
                     self.status_message = Some("usage: :db <path>".to_string());
                 }
@@ -984,18 +987,22 @@ impl App {
             "dir" => {
                 if let Some(p) = arg {
                     let path = crate::config::expand(p);
-                    if !path.exists() {
-                        let _ = fs::create_dir_all(&path);
-                    }
-                    self.root_dir = path.clone();
-                    self.source = Source::Dir(path.clone());
-                    self.refresh_file_list();
-                    if !self.files.is_empty() {
-                        self.open_file_at_index(0);
+                    if !crate::config::validate_path(&path) {
+                        self.status_message = Some(format!("Invalid path: {}", p));
                     } else {
-                        self.new_note();
+                        if !path.exists() {
+                            let _ = fs::create_dir_all(&path);
+                        }
+                        self.root_dir = path.clone();
+                        self.source = Source::Dir(path.clone());
+                        self.refresh_file_list();
+                        if !self.files.is_empty() {
+                            self.open_file_at_index(0);
+                        } else {
+                            self.new_note();
+                        }
+                        self.status_message = Some(format!("dir -> {}", path.display()));
                     }
-                    self.status_message = Some(format!("dir -> {}", path.display()));
                 } else {
                     self.status_message = Some("usage: :dir <path>".to_string());
                 }

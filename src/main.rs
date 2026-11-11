@@ -102,6 +102,9 @@ fn main() -> Result<()> {
     let source = match (&args.target, args.force) {
         (Some(t), force) => {
             let p = config::expand(t);
+            if !config::validate_path(&p) {
+                eprintln!("Warning: specified path may be invalid: {}", t);
+            }
             let looks_db = p
                 .extension()
                 .and_then(|e| e.to_str())
@@ -115,11 +118,35 @@ fn main() -> Result<()> {
                 None => Source::Dir(p),
             }
         }
-        (None, Some(SourceKind::Db)) => Source::Db(cfg.db_path()),
-        (None, Some(SourceKind::Dir)) => Source::Dir(cfg.dir_path()),
+        (None, Some(SourceKind::Db)) => {
+            let p = cfg.db_path();
+            if !config::validate_path(&p) {
+                eprintln!("Warning: configured db path may be invalid: {}", cfg.db);
+            }
+            Source::Db(p)
+        }
+        (None, Some(SourceKind::Dir)) => {
+            let p = cfg.dir_path();
+            if !config::validate_path(&p) {
+                eprintln!("Warning: configured dir path may be invalid: {}", cfg.dir);
+            }
+            Source::Dir(p)
+        }
         (None, None) => match cfg.source.to_ascii_lowercase().as_str() {
-            "dir" => Source::Dir(cfg.dir_path()),
-            _ => Source::Db(cfg.db_path()),
+            "dir" => {
+                let p = cfg.dir_path();
+                if !config::validate_path(&p) {
+                    eprintln!("Warning: configured dir path may be invalid: {}", cfg.dir);
+                }
+                Source::Dir(p)
+            }
+            _ => {
+                let p = cfg.db_path();
+                if !config::validate_path(&p) {
+                    eprintln!("Warning: configured db path may be invalid: {}", cfg.db);
+                }
+                Source::Db(p)
+            }
         },
     };
 
