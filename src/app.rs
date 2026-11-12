@@ -1442,11 +1442,12 @@ mod tests {
     #[test]
     fn db_invalid_target_does_not_change_source() {
         let dir = tmp_dir();
-        let blocker = dir.join("notadb");
+        // blocker は「ファイル」。その下のパスは open できない → 切替え失敗
+        let blocker = dir.join("blocker");
         fs::File::create(&blocker).unwrap();
         let mut app = App::new(Source::Dir(dir.clone()), dir.clone()).unwrap();
         let original_source = app.source.clone();
-        app.execute_command("db notadb");
+        app.execute_command("db blocker/inside/app.db");
         assert_eq!(app.source, original_source);
         let msg = app.status_message.as_ref().unwrap();
         assert!(msg.starts_with("Error:"));
