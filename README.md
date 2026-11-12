@@ -73,6 +73,14 @@ dir: ~/.chira/md        # source: dir で開くディレクトリ / :md :sync �
 - `Ctrl-r`: Redo（やり直し）
 - `Ctrl-s`: 上書き保存（クイック保存）
 
+### アンドゥ / リドゥ
+- 履歴は開いているドキュメントごとに 1 つで、Normal / Insert / Visual の各モードで共有します。ファイルやノートを切り替えると履歴は空になります。
+- モードの切り替え自体は履歴を変更しません。`i` で Insert に入り、編集せずに `Esc` で戻っても undo を 1 回分消費せず、redo も消えません。
+- 1 回の undo 単位は、Insert モードでの 1 回の入力セッション（`i` 〜 `Esc`）、または Normal / Visual での編集コマンド 1 回（`x`, `dd`, `p`, Visual の `d` / `x`）です。入力していないセッションは履歴に残りません。
+- `u` / `Ctrl-r` は Normal モードのキーです（Insert / Visual では undo / redo しません）。
+- 新しい編集を行うと、それ以降の redo は無効になります。
+- 履歴は最大 200 件です。
+
 ### 検索（Normal）
 - `/pattern`: 検索
 - `n`: 次の一致へ
@@ -90,6 +98,8 @@ dir: ~/.chira/md        # source: dir で開くディレクトリ / :md :sync �
 - `:prev`: 前のファイルを開く
 - `:md [dir]`: 外部コマンド `chira md [dir]` を実行（要 `cargo install chira-ura`）
 - `:sync [dir]`: 外部コマンド `chira md import [dir]` を実行（要 `cargo install chira-ura`）
+
+未保存の変更がある間は、`:db` / `:dir` / `:new` / `:next` / `:prev` / `:e` はバッファを差し替えず、その理由をメッセージに表示します。`:db` / `:dir` の読み込みに失敗した場合は読み込み元を切り替えません。
 
 ## データの扱い
 
