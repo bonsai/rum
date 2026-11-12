@@ -1,4 +1,5 @@
 use crate::buffer::{ClipboardContent, Position, TextBuffer};
+use crate::config::{BoxConfig, Config};
 use crate::doc::{derive_title, generate_note_id, Document, FrontMatter};
 use anyhow::Result;
 use chrono::Utc;
@@ -71,6 +72,14 @@ pub struct SearchState {
     pub current_index: Option<usize>,
 }
 
+/// PR #11: 3 ペイン UI のフォーカス対象（BOX / 紙 / エディタ）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Box,
+    Sheet,
+    Editor,
+}
+
 pub struct App {
     pub source: Source,
     /// md ディレクトリ（Source::Dir の実体 / `:md` `:sync` の既定）
@@ -100,6 +109,13 @@ pub struct App {
     pub should_quit: bool,
     pub viewport_top: usize,
 
+    // PR #11: 3 ペイン UI（BOX / 紙 / エディタ）と裏写りの状態
+    pub config: Config,
+    pub boxes: Vec<BoxConfig>,
+    pub box_index: usize,
+    pub focused_pane: Pane,
+    pub ura_enabled: bool,
+    pub prev_doc_lines: Option<Vec<String>>,
     /// Cached SQLite connection for DB mode
     pub db_conn: Option<Connection>,
     /// Path of the currently cached SQLite connection
@@ -108,6 +124,13 @@ pub struct App {
 
 impl App {
     pub fn new(source: Source, md_dir: PathBuf) -> Result<Self> {
+        // 既定設定（BOX 無し）で構築。設定ファイルを読む入口は new_with_config。
+        Self::new_with_config(Config::default(), source, md_dir)
+    }
+
+    /// PR #11: YAML 設定（BOX 一覧）を込めて App を構築する。
+    pub fn new_with_config(config: Config, source: Source, md_dir: PathBuf) -> Result<Self> {
+        let boxes = config.effective_boxes();
         let root_dir = match &source {
             Source::Dir(p) => p.clone(),
             Source::Db(_) => md_dir,
@@ -119,6 +142,10 @@ impl App {
         }
 
         let mut app = Self {
+            config,
+            boxes,
+            box_index: 0,
+            focused_pane: Pane::Editor,
             source,
             root_dir,
             files: Vec::new(),
@@ -138,15 +165,61 @@ impl App {
             pending_operator: None,
             should_quit: false,
             viewport_top: 0,
+            ura_enabled: true,
+            prev_doc_lines: None,
             db_conn: None,
             db_conn_path: None,
         };
+
+        // BOX のインデックスを現在の source と一致させる
+        if let Some(pos) = app
+            .boxes
+            .iter()
+            .position(|b| match (&app.source, b.source.as_str()) {
+                (Source::Db(p), "db") => &b.resolved_path() == p,
+                (Source::Dir(p), "dir") => &b.resolved_path() == p,
+                _ => false,
+            })
+        {
+            app.box_index = pos;
+        }
 
         app.refresh();
         let initial_result = app.open_initial();
         app.apply_command_result(initial_result);
 
         Ok(app)
+    }
+
+    /// 直前の紙（前の面）の行を取得（裏写り用）
+    pub fn update_prev_doc_lines(&mut self) {
+        self.prev_doc_lines = None;
+        match &self.source {
+            Source::Db(db_path) => {
+                if self.note_index > 0 && self.note_index - 1 < self.notes.len() {
+                    let prev_id = &self.notes[self.note_index - 1].id;
+                    if let Ok(conn) = Connection::open(db_path) {
+                        if let Ok(content) = conn.query_row(
+                            "SELECT content FROM notes WHERE id = ?1",
+                            rusqlite::params![prev_id],
+                            |r| r.get::<_, String>(0),
+                        ) {
+                            self.prev_doc_lines =
+                                Some(content.lines().map(|s| s.to_string()).collect());
+                        }
+                    }
+                }
+            }
+            Source::Dir(_) => {
+                if self.file_index > 0 && self.file_index - 1 < self.files.len() {
+                    let prev_file = &self.files[self.file_index - 1];
+                    if let Ok(doc) = Document::load_from_file(prev_file) {
+                        self.prev_doc_lines =
+                            Some(doc.body.lines().map(|s| s.to_string()).collect());
+                    }
+                }
+            }
+        }
     }
 
     /// Retrieve or open a cached database connection for the given path, configuring busy timeout and WAL mode.
@@ -333,6 +406,7 @@ impl App {
         };
         self.note_index = idx;
         self.viewport_top = 0;
+        self.update_prev_doc_lines();
         Ok(format!("\"{}\" opened", entry.title))
     }
 
@@ -394,6 +468,7 @@ impl App {
                 self.buffer = TextBuffer::from_string(&doc.body);
                 self.doc = doc;
                 self.file_index = idx;
+                self.update_prev_doc_lines();
                 Ok(format!(
                     "\"{}\" opened",
                     target.file_name().unwrap().to_string_lossy()
@@ -445,7 +520,45 @@ impl App {
         doc.ensure_front_matter();
         self.doc = doc;
         self.buffer = TextBuffer::new();
+        self.update_prev_doc_lines();
         "New note created".to_string()
+    }
+
+    /// PR #11: BOX をインデックス指定で切り替える
+    pub fn select_box(&mut self, idx: usize) {
+        if idx >= self.boxes.len() {
+            return;
+        }
+        self.box_index = idx;
+        let b = self.boxes[idx].clone();
+        let path = b.resolved_path();
+        match b.source.to_ascii_lowercase().as_str() {
+            "dir" => {
+                if !path.exists() {
+                    let _ = fs::create_dir_all(&path);
+                }
+                self.root_dir = path.clone();
+                self.source = Source::Dir(path);
+                self.refresh_file_list();
+                self.file_index = 0;
+                if !self.files.is_empty() {
+                    let _ = self.open_file_at_index(0);
+                } else {
+                    self.new_note();
+                }
+            }
+            _ => {
+                self.source = Source::Db(path);
+                self.refresh_notes();
+                self.note_index = 0;
+                if !self.notes.is_empty() {
+                    let _ = self.open_note_at_index(0);
+                } else {
+                    self.new_note();
+                }
+            }
+        }
+        self.status_message = Some(format!("Switched to BOX: {}", b.name));
     }
 
     pub fn save_current_file(&mut self, target_path: Option<&str>) -> Result<String, String> {
@@ -566,9 +679,37 @@ impl App {
         }
     }
 
+    /// PR #11: 次のペインへ（Tab）
+    pub fn next_pane(&mut self) {
+        self.focused_pane = match self.focused_pane {
+            Pane::Box => Pane::Sheet,
+            Pane::Sheet => Pane::Editor,
+            Pane::Editor => Pane::Box,
+        };
+    }
+
+    /// PR #11: 前のペインへ（Shift-Tab）
+    pub fn prev_pane(&mut self) {
+        self.focused_pane = match self.focused_pane {
+            Pane::Box => Pane::Editor,
+            Pane::Sheet => Pane::Box,
+            Pane::Editor => Pane::Sheet,
+        };
+    }
+
     fn handle_normal_key(&mut self, key: KeyEvent) {
         // Clear status message on key press if not setting a new one
         self.status_message = None;
+
+        // PR #11: Pane switching with Tab / Shift-Tab (BackTab)
+        if key.code == KeyCode::Tab {
+            self.next_pane();
+            return;
+        }
+        if key.code == KeyCode::BackTab {
+            self.prev_pane();
+            return;
+        }
 
         // Check Ctrl shortcuts
         if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -636,9 +777,25 @@ impl App {
                 self.search_input.clear();
                 self.search_cursor = 0;
             }
-            KeyCode::Char('n') => {
-                self.goto_next_search_match();
-            }
+            KeyCode::Char('n') => match self.focused_pane {
+                // PR #11: BOX ペインで n: 箱を新規作成
+                Pane::Box => {
+                    self.mode = Mode::Command;
+                    self.command_input = "box ".to_string();
+                    self.command_cursor = self.command_input.len();
+                    self.status_message =
+                        Some("Create new box: :box <name> <db|dir> <path>".to_string());
+                }
+                // PR #11: 紙ペインで n: 紙を新規作成
+                Pane::Sheet => {
+                    self.new_note();
+                    self.focused_pane = Pane::Editor;
+                    self.mode = Mode::Insert;
+                }
+                Pane::Editor => {
+                    self.goto_next_search_match();
+                }
+            },
             KeyCode::Char('N') => {
                 self.goto_prev_search_match();
             }
@@ -714,11 +871,49 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => {
                 self.buffer.move_right(false);
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.buffer.move_down();
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.buffer.move_up();
+            KeyCode::Char('j') | KeyCode::Down => match self.focused_pane {
+                // PR #11: BOX ペインでは次の BOX を選ぶ
+                Pane::Box => {
+                    if !self.boxes.is_empty() {
+                        let next = (self.box_index + 1) % self.boxes.len();
+                        self.select_box(next);
+                    }
+                }
+                // PR #11: 紙ペインでは次の紙へ
+                Pane::Sheet => {
+                    let result = self.next_file();
+                    self.apply_command_result(result);
+                }
+                Pane::Editor => {
+                    self.buffer.move_down();
+                }
+            },
+            KeyCode::Char('k') | KeyCode::Up => match self.focused_pane {
+                // PR #11: BOX ペインでは前の BOX を選ぶ
+                Pane::Box => {
+                    if !self.boxes.is_empty() {
+                        let prev = if self.box_index == 0 {
+                            self.boxes.len().saturating_sub(1)
+                        } else {
+                            self.box_index - 1
+                        };
+                        self.select_box(prev);
+                    }
+                }
+                // PR #11: 紙ペインでは前の紙へ
+                Pane::Sheet => {
+                    let result = self.prev_file();
+                    self.apply_command_result(result);
+                }
+                Pane::Editor => {
+                    self.buffer.move_up();
+                }
+            },
+            KeyCode::Enter => {
+                // PR #11: BOX / 紙ペインで Enter でエディタへ戻る
+                if self.focused_pane == Pane::Box || self.focused_pane == Pane::Sheet {
+                    self.focused_pane = Pane::Editor;
+                }
             }
             KeyCode::Char('w') => {
                 self.buffer.move_word_forward();
@@ -1175,6 +1370,56 @@ impl App {
         }
     }
 
+    /// PR #11: 裏写りの ON/OFF（:set ura | :set noura）
+    fn cmd_set(&mut self, arg: Option<&str>) -> Result<String, String> {
+        match arg {
+            Some("ura") => {
+                self.ura_enabled = true;
+                Ok("ura (裏写り) enabled".to_string())
+            }
+            Some("noura") => {
+                self.ura_enabled = false;
+                Ok("ura (裏写り) disabled".to_string())
+            }
+            _ => Err("usage: :set ura | :set noura".to_string()),
+        }
+    }
+
+    /// PR #11: BOX を設定に追加して選ぶ（:box <name> <db|dir> <path>）
+    fn cmd_box(&mut self, parts: &[&str]) -> Result<String, String> {
+        if parts.len() >= 4 {
+            let name = parts[1].to_string();
+            let kind = parts[2].to_lowercase();
+            let path_str = parts[3].to_string();
+            let is_dir = kind == "dir";
+            let new_box = BoxConfig {
+                name: name.clone(),
+                source: if is_dir {
+                    "dir".to_string()
+                } else {
+                    "db".to_string()
+                },
+                db: if is_dir { None } else { Some(path_str.clone()) },
+                dir: if is_dir { Some(path_str.clone()) } else { None },
+            };
+            match self.config.add_box(new_box) {
+                Ok(cfg_path) => {
+                    self.boxes = self.config.boxes.clone();
+                    let new_idx = self.boxes.len() - 1;
+                    self.select_box(new_idx);
+                    Ok(format!(
+                        "Added BOX \"{}\" to {}",
+                        name,
+                        cfg_path.display()
+                    ))
+                }
+                Err(e) => Err(format!("failed to save config: {e}")),
+            }
+        } else {
+            Err("usage: :box <name> <db|dir> <path>".to_string())
+        }
+    }
+
     pub fn execute_command(&mut self, command_line: &str) {
         self.mode = Mode::Normal;
 
@@ -1203,6 +1448,9 @@ impl App {
             "dir" => self.cmd_dir(arg),
             "md" => self.cmd_md(arg),
             "sync" => self.cmd_sync(arg),
+            // PR #11: 裏写りの ON/OFF と BOX 追加
+            "set" => self.cmd_set(arg),
+            "box" => self.cmd_box(&parts),
             _ => Err(format!("Unknown command: {}", cmd)),
         };
         self.apply_command_result(result);
@@ -1786,6 +2034,45 @@ mod tests {
         assert!(msg.starts_with("Error:"));
     }
 
+    // --- PR #11: 3 ペイン UI ---
+
+    #[test]
+    fn test_pane_switching() {
+        let dir = std::env::temp_dir().join("rum_pane_test");
+        let _ = fs::create_dir_all(&dir);
+        let mut app =
+            App::new_with_config(Config::default(), Source::Dir(dir.clone()), dir.clone()).unwrap();
+
+        assert_eq!(app.focused_pane, Pane::Editor);
+        app.next_pane();
+        assert_eq!(app.focused_pane, Pane::Box);
+        app.next_pane();
+        assert_eq!(app.focused_pane, Pane::Sheet);
+        app.next_pane();
+        assert_eq!(app.focused_pane, Pane::Editor);
+
+        app.prev_pane();
+        assert_eq!(app.focused_pane, Pane::Sheet);
+        app.prev_pane();
+        assert_eq!(app.focused_pane, Pane::Box);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_set_ura_toggle() {
+        let dir = std::env::temp_dir().join("rum_ura_test");
+        let _ = fs::create_dir_all(&dir);
+        let mut app =
+            App::new_with_config(Config::default(), Source::Dir(dir.clone()), dir.clone()).unwrap();
+
+        assert!(app.ura_enabled);
+        app.execute_command("set noura");
+        assert!(!app.ura_enabled);
+        app.execute_command("set ura");
+        assert!(app.ura_enabled);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn test_db_save_note_transaction_atomicity() {
         let temp_dir = std::env::temp_dir().join(format!(
@@ -1917,4 +2204,5 @@ mod tests {
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }
+
 

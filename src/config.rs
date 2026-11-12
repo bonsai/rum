@@ -1,5 +1,31 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+/// BOX（箱 / ノートブック）の設定
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoxConfig {
+    pub name: String,
+    pub source: String, // "db" または "dir"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+}
+
+impl BoxConfig {
+    pub fn resolved_path(&self) -> PathBuf {
+        match self.source.to_ascii_lowercase().as_str() {
+            "dir" => {
+                let p = self.dir.as_deref().unwrap_or("~/.chira/md");
+                expand(p)
+            }
+            _ => {
+                let p = self.db.as_deref().unwrap_or("~/.chira/ura.db");
+                expand(p)
+            }
+        }
+    }
+}
 
 /// rum の設定。パスはハードコードせず YAML から読む。
 ///
@@ -10,7 +36,7 @@ use std::path::{Path, PathBuf};
 ///   4. `~/.chira/rum.yaml`
 ///
 /// 値が無いフィールドは Default（下記）で埋まる。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// 既定の読み込み元: "db"（SQLite）または "dir"（md/txt ディレクトリ）
@@ -19,6 +45,12 @@ pub struct Config {
     pub db: String,
     /// source: dir のときに開くディレクトリ（`:md` / `:sync` の既定でもある）
     pub dir: String,
+    /// BOX 一覧（未設定の場合は source/db/dir から自動生成）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub boxes: Vec<BoxConfig>,
+    /// 読み込んだ設定ファイルのパス（追記・保存用）
+    #[serde(skip)]
+    pub loaded_path: Option<PathBuf>,
 }
 
 impl Default for Config {
@@ -27,6 +59,8 @@ impl Default for Config {
             source: "db".to_string(),
             db: "~/.chira/ura.db".to_string(),
             dir: "~/.chira/md".to_string(),
+            boxes: Vec::new(),
+            loaded_path: None,
         }
     }
 }
@@ -40,7 +74,8 @@ impl Config {
         };
         if let Some(path) = path {
             if let Ok(text) = std::fs::read_to_string(&path) {
-                if let Ok(cfg) = serde_yaml::from_str::<Config>(&text) {
+                if let Ok(mut cfg) = serde_yaml::from_str::<Config>(&text) {
+                    cfg.loaded_path = Some(path);
                     return cfg;
                 }
             }
@@ -54,6 +89,54 @@ impl Config {
 
     pub fn dir_path(&self) -> PathBuf {
         expand(&self.dir)
+    }
+
+    /// 有効な BOX 一覧を返す。
+    /// `boxes` が空なら後方互換として既存の source / db / dir から 1 つ生成する。
+    pub fn effective_boxes(&self) -> Vec<BoxConfig> {
+        if !self.boxes.is_empty() {
+            return self.boxes.clone();
+        }
+        let is_dir = self.source.eq_ignore_ascii_case("dir");
+        vec![BoxConfig {
+            name: if is_dir {
+                "下書き".to_string()
+            } else {
+                "メモ".to_string()
+            },
+            source: if is_dir {
+                "dir".to_string()
+            } else {
+                "db".to_string()
+            },
+            db: if is_dir { None } else { Some(self.db.clone()) },
+            dir: if is_dir { Some(self.dir.clone()) } else { None },
+        }]
+    }
+
+    /// 新しい BOX を設定に追加し、設定ファイルに保存する。
+    pub fn add_box(&mut self, box_cfg: BoxConfig) -> anyhow::Result<PathBuf> {
+        if self.boxes.is_empty() {
+            self.boxes = self.effective_boxes();
+        }
+        self.boxes.push(box_cfg);
+
+        let target_path = self.loaded_path.clone().unwrap_or_else(|| {
+            dirs::config_dir()
+                .map(|d| d.join("rum").join("config.yaml"))
+                .unwrap_or_else(|| PathBuf::from("rum.yaml"))
+        });
+
+        if let Some(parent) = target_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+
+        let yaml = serde_yaml::to_string(self)?;
+        std::fs::write(&target_path, yaml)?;
+        self.loaded_path = Some(target_path.clone());
+        Ok(target_path)
     }
 }
 
@@ -195,6 +278,50 @@ mod tests {
         assert_eq!(cfg.dir, "/tmp/notes");
         // 未指定は Default
         assert!(cfg.db.ends_with("ura.db"));
+        let boxes = cfg.effective_boxes();
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(boxes[0].name, "下書き");
+        assert_eq!(boxes[0].source, "dir");
+    }
+
+    #[test]
+    fn yaml_parses_boxes() {
+        let yaml = r#"
+boxes:
+  - name: メモ
+    source: db
+    db: ~/.chira/ura.db
+  - name: 下書き
+    source: dir
+    dir: ~/.chira/md
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(cfg.boxes.len(), 2);
+        assert_eq!(cfg.boxes[0].name, "メモ");
+        assert_eq!(cfg.boxes[0].source, "db");
+        assert_eq!(cfg.boxes[1].name, "下書き");
+        assert_eq!(cfg.boxes[1].source, "dir");
+    }
+
+    #[test]
+    fn add_box_persists_to_file() {
+        let tmp = std::env::temp_dir().join("rum_test_config.yaml");
+        let mut cfg = Config {
+            loaded_path: Some(tmp.clone()),
+            ..Config::default()
+        };
+        cfg.add_box(BoxConfig {
+            name: "新規箱".to_string(),
+            source: "dir".to_string(),
+            db: None,
+            dir: Some("/tmp/new_box".to_string()),
+        })
+        .unwrap();
+
+        let loaded = Config::load(Some(tmp.to_str().unwrap()));
+        assert_eq!(loaded.boxes.len(), 2);
+        assert_eq!(loaded.boxes[1].name, "新規箱");
+        let _ = std::fs::remove_file(tmp);
     }
 
     #[test]
