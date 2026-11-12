@@ -56,35 +56,31 @@ impl Document {
         }
     }
 
-    /// Save to current path or specific path. Updates `updatedAt` on save if front_matter exists.
-    /// If front_matter does not exist but it's saved as .md (or newly requested front matter),
-    /// we check if we should create front matter or keep plain text:
-    /// Per task instructions:
-    /// "front matter（id / title / updatedAt）を保って保存。保存時 updatedAt を now に。
-    ///  id が無ければ採番して front matter を作る。front matter の無いファイルは素テキストのまま保存。"
+    /// 保存先の形式で front matter の扱いを決めて保存する。
+    /// `.md` は front matter（id / title / updatedAt）を保って保存し、保存時 `updatedAt` を now にする。
+    /// front matter の無い `.md` に保存するときは作らず、本文だけを書く（新規作成の判断は呼び出し側が持つ）。
+    /// `.md` 以外（plain text）は front matter を書かず、編集中の front matter があっても本文だけを保存する。
     pub fn save_to<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<()> {
         let path_ref = path.as_ref();
-        let now = Utc::now().timestamp_millis();
+        let markdown = is_markdown(path_ref);
 
-        if let Some(fm) = &mut self.front_matter {
-            if fm.id.is_empty() {
-                fm.id = generate_note_id(now);
-            }
-            fm.updated_at = now;
-            // Always keep title up to date or fallback to derive_title
-            fm.title = derive_title(&self.body);
-        }
-
-        let content = self.to_string_content();
-        if let Some(parent) = path_ref.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
+        if markdown {
+            if let Some(fm) = &mut self.front_matter {
+                let now = Utc::now().timestamp_millis();
+                if fm.id.is_empty() {
+                    fm.id = generate_note_id(now);
+                }
+                fm.updated_at = now;
+                fm.title = derive_title(&self.body);
             }
         }
-        fs::write(path_ref, content)?;
-        self.path = Some(path_ref.to_path_buf());
-        self.modified = false;
-        Ok(())
+
+        let content = if markdown {
+            self.to_string_content()
+        } else {
+            self.body.clone()
+        };
+        self.write(path_ref, content)
     }
 
     pub fn save(&mut self) -> anyhow::Result<()> {
@@ -93,6 +89,19 @@ impl Document {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("No file name specified"))?;
         self.save_to(path)
+    }
+
+    /// 親ディレクトリを作成してから content を書き、保存状態を更新する。
+    fn write(&mut self, path: &Path, content: String) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(path, content)?;
+        self.path = Some(path.to_path_buf());
+        self.modified = false;
+        Ok(())
     }
 
     /// Create default front matter for newly created markdown note
@@ -108,6 +117,16 @@ impl Document {
             self.modified = true;
         }
     }
+}
+
+/// front matter を持つ形式は `.md` だけ。拡張子の大文字小文字は問わない。
+/// それ以外は plain text として保存する。
+pub fn is_markdown<P: AsRef<Path>>(path: P) -> bool {
+    path.as_ref()
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("md"))
+        .unwrap_or(false)
 }
 
 /// Generate note ID matching chira-ura format: note-<now>-<rand4>
@@ -288,6 +307,27 @@ mod tests {
         let loaded = Document::load_from_file(&tmp).unwrap();
         assert!(loaded.front_matter.is_none());
         assert_eq!(loaded.body, "Plain text note\nsecond line");
+        let _ = fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn test_document_with_front_matter_saved_to_txt_stays_plain() {
+        let tmp = std::env::temp_dir().join("rum_test_front_matter_to_txt.txt");
+        let source = "---\nid: note-1\ntitle: T\nupdatedAt: 1\n---\nbody\n";
+        let mut doc = Document {
+            path: Some(std::env::temp_dir().join("rum_test_front_matter_source.md")),
+            front_matter: parse_markdown_or_plain(source).0,
+            body: "body\n".to_string(),
+            modified: true,
+        };
+        doc.save_to(&tmp).unwrap();
+
+        assert!(doc.front_matter.is_some());
+        assert_eq!(fs::read_to_string(&tmp).unwrap(), "body\n");
+
+        let loaded = Document::load_from_file(&tmp).unwrap();
+        assert!(loaded.front_matter.is_none());
+        assert_eq!(loaded.body, "body\n");
         let _ = fs::remove_file(tmp);
     }
 }

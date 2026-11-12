@@ -1,5 +1,5 @@
 use crate::buffer::{ClipboardContent, Position, TextBuffer};
-use crate::doc::{derive_title, generate_note_id, Document, FrontMatter};
+use crate::doc::{derive_title, generate_note_id, is_markdown, Document, FrontMatter};
 use anyhow::Result;
 use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -38,6 +38,67 @@ pub struct SearchState {
     pub pattern: String,
     pub matches: Vec<Position>,
     pub current_index: Option<usize>,
+}
+
+/// コマンドの実行結果。分類（`dispatch_command`）と表示（`apply_outcome`）を分ける。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CommandOutcome {
+    /// 成功（追加のメッセージなし）
+    Done,
+    /// 実行結果をそのまま表示する（usage / 確認 / 成功通知）
+    Notice(String),
+    /// 失敗。表示は `Error: {detail}` に統一される
+    Failure(String),
+    /// 終了
+    Quit,
+}
+
+/// DB のノート一覧を読む（接続〜クエリまで）。一覧の取得元が 1 か所になる。
+fn load_notes(path: &Path) -> Result<Vec<NoteEntry>> {
+    let conn = Connection::open(path)?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS notes (\
+         id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', \
+         content TEXT NOT NULL DEFAULT '', updatedAt INTEGER NOT NULL DEFAULT 0)",
+        rusqlite::params![],
+    )?;
+    let mut stmt = conn.prepare(
+        "SELECT id, title, updatedAt FROM notes ORDER BY updatedAt DESC, id DESC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![], |r| {
+        Ok(NoteEntry {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            updated_at: r.get(2)?,
+        })
+    })?;
+    let mut notes = Vec::new();
+    for n in rows {
+        notes.push(n?);
+    }
+    Ok(notes)
+}
+
+/// ディレクトリ内の md/txt をパス順に集める。
+fn collect_files(dir: &Path) -> Vec<PathBuf> {
+    let mut list = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let ext = path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if ext == "md" || ext == "txt" {
+                    list.push(path);
+                }
+            }
+        }
+    }
+    list.sort();
+    list
 }
 
 pub struct App {
@@ -120,16 +181,20 @@ impl App {
     }
 
     fn open_initial(&mut self) {
-        if matches!(self.source, Source::Db(_)) {
-            if !self.notes.is_empty() {
-                self.open_note_at_index(0);
-            } else {
+        let opened = if matches!(self.source, Source::Db(_)) {
+            if self.notes.is_empty() {
                 self.new_note();
+                return;
             }
-        } else if !self.files.is_empty() {
-            self.open_file_at_index(0);
-        } else {
+            self.open_note_at_index(0)
+        } else if self.files.is_empty() {
             self.new_note();
+            return;
+        } else {
+            self.open_file_at_index(0)
+        };
+        if let Err(e) = opened {
+            self.status_message = Some(format!("Error: {e}"));
         }
     }
 
@@ -141,30 +206,8 @@ impl App {
             _ => None,
         };
         if let Some(path) = db_path {
-            match Connection::open(&path) {
-                Ok(conn) => {
-                    let _ = conn.execute(
-                        "CREATE TABLE IF NOT EXISTS notes (\
-                         id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', \
-                         content TEXT NOT NULL DEFAULT '', updatedAt INTEGER NOT NULL DEFAULT 0)",
-                        rusqlite::params![],
-                    );
-                    if let Ok(mut stmt) = conn.prepare(
-                        "SELECT id, title, updatedAt FROM notes ORDER BY updatedAt DESC, id DESC",
-                    ) {
-                        if let Ok(rows) = stmt.query_map(rusqlite::params![], |r| {
-                            Ok(NoteEntry {
-                                id: r.get(0)?,
-                                title: r.get(1)?,
-                                updated_at: r.get(2)?,
-                            })
-                        }) {
-                            for n in rows.flatten() {
-                                self.notes.push(n);
-                            }
-                        }
-                    }
-                }
+            match load_notes(&path) {
+                Ok(notes) => self.notes = notes,
                 Err(e) => {
                     self.status_message = Some(format!("db open failed: {}: {e}", path.display()));
                 }
@@ -176,29 +219,21 @@ impl App {
     }
 
     /// DB の 1 ノートを開いて本文をバッファに載せる
-    pub fn open_note_at_index(&mut self, idx: usize) {
+    pub fn open_note_at_index(&mut self, idx: usize) -> Result<()> {
         if idx >= self.notes.len() {
-            return;
+            return Ok(());
         }
         let entry = self.notes[idx].clone();
         let db_path = match &self.source {
             Source::Db(p) => p.clone(),
-            _ => return,
+            _ => return Ok(()),
         };
-        let conn = match Connection::open(&db_path) {
-            Ok(c) => c,
-            Err(e) => {
-                self.status_message = Some(format!("db open failed: {e}"));
-                return;
-            }
-        };
-        let content: String = conn
-            .query_row(
-                "SELECT content FROM notes WHERE id = ?1",
-                rusqlite::params![&entry.id],
-                |r| r.get(0),
-            )
-            .unwrap_or_default();
+        let conn = Connection::open(&db_path)?;
+        let content: String = conn.query_row(
+            "SELECT content FROM notes WHERE id = ?1",
+            rusqlite::params![&entry.id],
+            |r| r.get(0),
+        )?;
         self.buffer = TextBuffer::from_string(&content);
         self.doc = Document {
             path: None,
@@ -214,6 +249,7 @@ impl App {
         self.note_index = idx;
         self.viewport_top = 0;
         self.status_message = Some(format!("\"{}\" opened", entry.title));
+        Ok(())
     }
 
     /// DB モードで保存（upsert）
@@ -255,40 +291,31 @@ impl App {
     }
 
     pub fn refresh_file_list(&mut self) {
-        let mut list = Vec::new();
-        if let Ok(entries) = fs::read_dir(&self.root_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    let ext = path
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_lowercase();
-                    if ext == "md" || ext == "txt" {
-                        list.push(path);
-                    }
-                }
-            }
-        }
-        list.sort();
-        self.files = list;
+        self.files = collect_files(&self.root_dir);
     }
 
-    pub fn open_file_at_index(&mut self, idx: usize) {
-        if idx < self.files.len() {
-            let target = &self.files[idx];
-            if let Ok(doc) = Document::load_from_file(target) {
-                self.buffer = TextBuffer::from_string(&doc.body);
-                self.doc = doc;
-                self.file_index = idx;
-                self.status_message = Some(format!(
-                    "\"{}\" opened",
-                    target.file_name().unwrap().to_string_lossy()
-                ));
-            } else {
-                self.status_message = Some("Failed to read file".to_string());
-            }
+    pub fn open_file_at_index(&mut self, idx: usize) -> Result<()> {
+        if idx >= self.files.len() {
+            return Ok(());
+        }
+        let target = self.files[idx].clone();
+        let doc = Document::load_from_file(&target)?;
+        self.buffer = TextBuffer::from_string(&doc.body);
+        self.doc = doc;
+        self.file_index = idx;
+        self.status_message = Some(format!(
+            "\"{}\" opened",
+            target.file_name().unwrap().to_string_lossy()
+        ));
+        Ok(())
+    }
+
+    /// 引数のパスを root_dir 基準の実パスに解決する。
+    fn resolve_target_path(&self, p: &str) -> PathBuf {
+        if Path::new(p).is_relative() {
+            self.root_dir.join(p)
+        } else {
+            PathBuf::from(p)
         }
     }
 
@@ -315,8 +342,7 @@ impl App {
             // Create a new document with this path
             let mut doc = Document::new_empty();
             doc.path = Some(full_path.clone());
-            let ext = full_path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext == "md" {
+            if is_markdown(&full_path) {
                 doc.ensure_front_matter();
             }
             self.buffer = TextBuffer::new();
@@ -340,43 +366,28 @@ impl App {
 
     pub fn save_current_file(&mut self, target_path: Option<&str>) -> Result<()> {
         self.doc.body = self.buffer.to_string();
+        let explicit_target = target_path.map(|p| self.resolve_target_path(p));
+
+        if let Some(path) = &explicit_target {
+            // 明示された `.md` 保存先は新規作成として front matter を補完する。
+            if is_markdown(path) {
+                self.doc.ensure_front_matter();
+            }
+            self.doc.save_to(path)?;
+        }
 
         if matches!(self.source, Source::Db(_)) {
-            if let Some(p) = target_path {
-                let path_buf = if Path::new(p).is_relative() {
-                    self.root_dir.join(p)
-                } else {
-                    PathBuf::from(p)
-                };
-                let ext = path_buf.extension().and_then(|s| s.to_str()).unwrap_or("");
-                if ext == "md" {
-                    self.doc.ensure_front_matter();
-                }
-                let _ = self.doc.save_to(&path_buf);
-            }
             return self.save_note();
         }
 
-        if let Some(p) = target_path {
-            let path_buf = if Path::new(p).is_relative() {
-                self.root_dir.join(p)
+        if explicit_target.is_none() {
+            if self.doc.path.is_some() {
+                self.doc.save()?;
             } else {
-                PathBuf::from(p)
-            };
-            let ext = path_buf.extension().and_then(|s| s.to_str()).unwrap_or("");
-            if ext == "md" {
-                self.doc.ensure_front_matter();
+                let now = chrono::Utc::now().timestamp_millis();
+                let name = format!("{}.md", now);
+                self.doc.save_to(self.root_dir.join(name))?;
             }
-            self.doc.save_to(&path_buf)?;
-        } else if self.doc.path.is_none() {
-            // Generate filename based on date / note id
-            let now = chrono::Utc::now().timestamp_millis();
-            let name = format!("{}.md", now);
-            let path_buf = self.root_dir.join(name);
-            self.doc.ensure_front_matter();
-            self.doc.save_to(&path_buf)?;
-        } else {
-            self.doc.save()?;
         }
 
         self.refresh_file_list();
@@ -392,44 +403,74 @@ impl App {
         Ok(())
     }
 
-    pub fn next_file(&mut self) {
-        if matches!(self.source, Source::Db(_)) {
-            if self.notes.is_empty() {
-                return;
-            }
-            let next_idx = (self.note_index + 1) % self.notes.len();
-            self.open_note_at_index(next_idx);
-            return;
+    /// バッファ差し替え前に未保存変更を拒否する。
+    /// override 不可のコマンドと `!` 付きコマンドで文言が異なる。
+    fn reject_if_modified(&self, override_hint: bool) -> Option<CommandOutcome> {
+        if !self.doc.modified {
+            return None;
         }
-        if self.files.is_empty() {
-            return;
-        }
-        let next_idx = (self.file_index + 1) % self.files.len();
-        self.open_file_at_index(next_idx);
+        let msg = if override_hint {
+            "No write since last change (add ! to override)"
+        } else {
+            "No write since last change (save or discard first)"
+        };
+        Some(CommandOutcome::Notice(msg.to_string()))
     }
 
-    pub fn prev_file(&mut self) {
+    pub fn next_file(&mut self) -> CommandOutcome {
+        if let Some(rejection) = self.reject_if_modified(false) {
+            return rejection;
+        }
         if matches!(self.source, Source::Db(_)) {
             if self.notes.is_empty() {
-                return;
+                return CommandOutcome::Notice("No notes".to_string());
+            }
+            let next_idx = (self.note_index + 1) % self.notes.len();
+            return match self.open_note_at_index(next_idx) {
+                Ok(()) => CommandOutcome::Done,
+                Err(e) => CommandOutcome::Failure(format!("cannot open note: {e}")),
+            };
+        }
+        if self.files.is_empty() {
+            return CommandOutcome::Notice("No files".to_string());
+        }
+        let next_idx = (self.file_index + 1) % self.files.len();
+        match self.open_file_at_index(next_idx) {
+            Ok(()) => CommandOutcome::Done,
+            Err(e) => CommandOutcome::Failure(format!("cannot open file: {e}")),
+        }
+    }
+
+    pub fn prev_file(&mut self) -> CommandOutcome {
+        if let Some(rejection) = self.reject_if_modified(false) {
+            return rejection;
+        }
+        if matches!(self.source, Source::Db(_)) {
+            if self.notes.is_empty() {
+                return CommandOutcome::Notice("No notes".to_string());
             }
             let prev_idx = if self.note_index == 0 {
                 self.notes.len().saturating_sub(1)
             } else {
                 self.note_index - 1
             };
-            self.open_note_at_index(prev_idx);
-            return;
+            return match self.open_note_at_index(prev_idx) {
+                Ok(()) => CommandOutcome::Done,
+                Err(e) => CommandOutcome::Failure(format!("cannot open note: {e}")),
+            };
         }
         if self.files.is_empty() {
-            return;
+            return CommandOutcome::Notice("No files".to_string());
         }
         let prev_idx = if self.file_index == 0 {
             self.files.len().saturating_sub(1)
         } else {
             self.file_index - 1
         };
-        self.open_file_at_index(prev_idx);
+        match self.open_file_at_index(prev_idx) {
+            Ok(()) => CommandOutcome::Done,
+            Err(e) => CommandOutcome::Failure(format!("cannot open file: {e}")),
+        }
     }
 
     // --- Key Event Handler ---
@@ -458,11 +499,13 @@ impl App {
                     return;
                 }
                 KeyCode::Char('p') => {
-                    self.prev_file();
+                    let outcome = self.prev_file();
+                    self.apply_outcome(outcome);
                     return;
                 }
                 KeyCode::Char('n') => {
-                    self.next_file();
+                    let outcome = self.next_file();
+                    self.apply_outcome(outcome);
                     return;
                 }
                 KeyCode::Char('r') => {
@@ -814,6 +857,7 @@ impl App {
             self.buffer.cursor = start;
         }
         self.buffer.clamp_cursor(false);
+        self.buffer.commit_edit();
     }
 
     // --- Search helpers ---
@@ -898,7 +942,22 @@ impl App {
 
     // --- Command parser & execution ---
 
+    /// コマンドの実行結果を唯一の出力点で反映する。
+    fn apply_outcome(&mut self, outcome: CommandOutcome) {
+        match outcome {
+            CommandOutcome::Done => {}
+            CommandOutcome::Notice(msg) => self.status_message = Some(msg),
+            CommandOutcome::Failure(detail) => {
+                self.status_message = Some(format!("Error: {detail}"));
+            }
+            CommandOutcome::Quit => self.should_quit = true,
+        }
+    }
+
+    /// コマンドを実行する。どの結果でもモードは Normal に戻る。
     pub fn execute_command(&mut self, command_line: &str) {
+        self.mode = Mode::Normal;
+
         let parts: Vec<&str> = command_line.split_whitespace().collect();
         if parts.is_empty() {
             return;
@@ -907,159 +966,822 @@ impl App {
         let cmd = parts[0];
         let arg = parts.get(1).copied();
 
+        let outcome = self.dispatch_command(cmd, arg);
+        self.apply_outcome(outcome);
+    }
+
+    fn dispatch_command(&mut self, cmd: &str, arg: Option<&str>) -> CommandOutcome {
         match cmd {
-            "w" => {
-                if let Err(e) = self.save_current_file(arg) {
-                    self.status_message = Some(format!("Error: {}", e));
-                }
-            }
+            "w" => match self.save_current_file(arg) {
+                Ok(()) => CommandOutcome::Done,
+                Err(e) => CommandOutcome::Failure(e.to_string()),
+            },
             "q" => {
-                if self.doc.modified {
-                    self.status_message =
-                        Some("No write since last change (add ! to override)".to_string());
+                if let Some(rejection) = self.reject_if_modified(true) {
+                    rejection
                 } else {
-                    self.should_quit = true;
+                    CommandOutcome::Quit
                 }
             }
-            "q!" => {
-                self.should_quit = true;
-            }
-            "wq" | "x" => {
-                if let Err(e) = self.save_current_file(arg) {
-                    self.status_message = Some(format!("Error: {}", e));
-                } else {
-                    self.should_quit = true;
-                }
-            }
+            "q!" => CommandOutcome::Quit,
+            "wq" | "x" => match self.save_current_file(arg) {
+                Ok(()) => CommandOutcome::Quit,
+                Err(e) => CommandOutcome::Failure(e.to_string()),
+            },
             "e" => {
-                if let Some(path) = arg {
-                    if self.doc.modified {
-                        self.status_message =
-                            Some("No write since last change (add ! to override)".to_string());
-                    } else if let Err(e) = self.open_file_path(path) {
-                        self.status_message = Some(format!("Error: {}", e));
-                    }
-                } else {
-                    self.status_message = Some("Argument required for :e".to_string());
+                let Some(path) = arg else {
+                    return CommandOutcome::Notice("Argument required for :e".to_string());
+                };
+                if let Some(rejection) = self.reject_if_modified(true) {
+                    return rejection;
+                }
+                match self.open_file_path(path) {
+                    Ok(()) => CommandOutcome::Done,
+                    Err(e) => CommandOutcome::Failure(e.to_string()),
                 }
             }
             "e!" => {
                 if let Some(path) = arg {
-                    if let Err(e) = self.open_file_path(path) {
-                        self.status_message = Some(format!("Error: {}", e));
-                    }
-                } else if let Some(cur_path) = self.doc.path.clone() {
-                    let _ = self.open_file_path(cur_path);
-                    self.status_message = Some("Reloaded".to_string());
+                    return match self.open_file_path(path) {
+                        Ok(()) => CommandOutcome::Done,
+                        Err(e) => CommandOutcome::Failure(e.to_string()),
+                    };
+                }
+                let Some(cur_path) = self.doc.path.clone() else {
+                    return CommandOutcome::Notice("No file name".to_string());
+                };
+                // 再読み込み（e!）は disk 上の現物を読み直す。無ければ新規作成せずエラー。
+                if !cur_path.exists() {
+                    return CommandOutcome::Failure(format!(
+                        "No such file: {}",
+                        cur_path.file_name().unwrap().to_string_lossy()
+                    ));
+                }
+                match self.open_file_path(cur_path) {
+                    Ok(()) => CommandOutcome::Notice("Reloaded".to_string()),
+                    Err(e) => CommandOutcome::Failure(e.to_string()),
                 }
             }
             "new" => {
-                if self.doc.modified {
-                    self.status_message =
-                        Some("No write since last change (save or discard first)".to_string());
-                } else {
-                    self.new_note();
+                if let Some(rejection) = self.reject_if_modified(false) {
+                    return rejection;
                 }
+                self.new_note();
+                CommandOutcome::Done
             }
-            "next" => {
-                self.next_file();
+            "next" => self.next_file(),
+            "prev" => self.prev_file(),
+            "db" => self.switch_to_db(arg),
+            "dir" => self.switch_to_dir(arg),
+            "md" => self.run_chira(arg, false),
+            "sync" => self.run_chira(arg, true),
+            _ => CommandOutcome::Notice(format!("Unknown command: {cmd}")),
+        }
+    }
+
+    /// `:db <path>` — 読み込み成功後にだけ source と一覧を差し替える。
+    fn switch_to_db(&mut self, arg: Option<&str>) -> CommandOutcome {
+        let Some(p) = arg else {
+            return CommandOutcome::Notice("usage: :db <path>".to_string());
+        };
+        if let Some(rejection) = self.reject_if_modified(false) {
+            return rejection;
+        }
+        let path = crate::config::expand(p);
+        if !crate::config::validate_path(&path) {
+            return CommandOutcome::Notice(format!("Invalid path: {p}"));
+        }
+        let notes = match load_notes(&path) {
+            Ok(notes) => notes,
+            Err(e) => {
+                return CommandOutcome::Failure(format!(
+                    "db open failed: {}: {e}",
+                    path.display()
+                ))
             }
-            "prev" => {
-                self.prev_file();
-            }
-            "db" => {
-                if let Some(p) = arg {
-                    let path = crate::config::expand(p);
-                    if !crate::config::validate_path(&path) {
-                        self.status_message = Some(format!("Invalid path: {}", p));
-                    } else {
-                        self.source = Source::Db(path.clone());
-                        self.refresh_notes();
-                        if !self.notes.is_empty() {
-                            self.open_note_at_index(0);
-                        } else {
-                            self.new_note();
-                        }
-                        self.status_message = Some(format!("db -> {}", path.display()));
-                    }
-                } else {
-                    self.status_message = Some("usage: :db <path>".to_string());
-                }
-            }
-            "dir" => {
-                if let Some(p) = arg {
-                    let path = crate::config::expand(p);
-                    if !crate::config::validate_path(&path) {
-                        self.status_message = Some(format!("Invalid path: {}", p));
-                    } else {
-                        if !path.exists() {
-                            let _ = fs::create_dir_all(&path);
-                        }
-                        self.root_dir = path.clone();
-                        self.source = Source::Dir(path.clone());
-                        self.refresh_file_list();
-                        if !self.files.is_empty() {
-                            self.open_file_at_index(0);
-                        } else {
-                            self.new_note();
-                        }
-                        self.status_message = Some(format!("dir -> {}", path.display()));
-                    }
-                } else {
-                    self.status_message = Some("usage: :dir <path>".to_string());
-                }
-            }
-            "md" => {
-                // External `chira md [dir]`
-                let target_dir = arg.unwrap_or(self.root_dir.to_str().unwrap_or(""));
-                self.status_message = Some(format!("Running chira md {}...", target_dir));
-                let output = ProcessCommand::new("chira")
-                    .arg("md")
-                    .arg(target_dir)
-                    .output();
-                match output {
-                    Ok(out) => {
-                        self.refresh_file_list();
-                        if out.status.success() {
-                            self.status_message = Some("chira md completed".to_string());
-                        } else {
-                            let err_msg = String::from_utf8_lossy(&out.stderr);
-                            self.status_message =
-                                Some(format!("chira md failed: {}", err_msg.trim()));
-                        }
-                    }
-                    Err(e) => {
-                        self.status_message = Some(format!("Failed to run chira: {}", e));
-                    }
-                }
-            }
-            "sync" => {
-                // External `chira md import [dir]`
-                let target_dir = arg.unwrap_or(self.root_dir.to_str().unwrap_or(""));
-                self.status_message = Some(format!("Running chira md import {}...", target_dir));
-                let output = ProcessCommand::new("chira")
-                    .arg("md")
-                    .arg("import")
-                    .arg(target_dir)
-                    .output();
-                match output {
-                    Ok(out) => {
-                        if out.status.success() {
-                            self.status_message = Some("chira md import completed".to_string());
-                        } else {
-                            let err_msg = String::from_utf8_lossy(&out.stderr);
-                            self.status_message =
-                                Some(format!("chira md import failed: {}", err_msg.trim()));
-                        }
-                    }
-                    Err(e) => {
-                        self.status_message = Some(format!("Failed to run chira: {}", e));
-                    }
-                }
-            }
-            _ => {
-                self.status_message = Some(format!("Unknown command: {}", cmd));
+        };
+        self.source = Source::Db(path.clone());
+        self.notes = notes;
+        self.note_index = 0;
+        if self.notes.is_empty() {
+            self.new_note();
+            return CommandOutcome::Notice(format!("db -> {}", path.display()));
+        }
+        if let Err(e) = self.open_note_at_index(0) {
+            return CommandOutcome::Failure(format!("cannot open note: {e}"));
+        }
+        CommandOutcome::Notice(format!("db -> {}", path.display()))
+    }
+
+    /// `:dir <path>` — 読み込み成功後にだけ source と一覧を差し替える。
+    fn switch_to_dir(&mut self, arg: Option<&str>) -> CommandOutcome {
+        let Some(p) = arg else {
+            return CommandOutcome::Notice("usage: :dir <path>".to_string());
+        };
+        if let Some(rejection) = self.reject_if_modified(false) {
+            return rejection;
+        }
+        let path = crate::config::expand(p);
+        if !crate::config::validate_path(&path) {
+            return CommandOutcome::Notice(format!("Invalid path: {p}"));
+        }
+        if !path.exists() {
+            if let Err(e) = fs::create_dir_all(&path) {
+                return CommandOutcome::Failure(format!(
+                    "cannot create {}: {e}",
+                    path.display()
+                ));
             }
         }
+        if !path.is_dir() {
+            return CommandOutcome::Notice(format!("Not a directory: {}", path.display()));
+        }
+        let files = collect_files(&path);
+        self.root_dir = path.clone();
+        self.source = Source::Dir(path.clone());
+        self.files = files;
+        self.file_index = 0;
+        if self.files.is_empty() {
+            self.new_note();
+            return CommandOutcome::Notice(format!("dir -> {}", path.display()));
+        }
+        if let Err(e) = self.open_file_at_index(0) {
+            return CommandOutcome::Failure(format!("cannot open file: {e}"));
+        }
+        CommandOutcome::Notice(format!("dir -> {}", path.display()))
+    }
+
+    /// `:md [dir]` / `:sync [dir]` — 外部 chira の実行結果を報告する。
+    fn run_chira(&mut self, arg: Option<&str>, import: bool) -> CommandOutcome {
+        let target_dir = match arg {
+            Some(p) => p.to_string(),
+            None => match self.root_dir.to_str() {
+                Some(dir) => dir.to_string(),
+                None => return CommandOutcome::Notice("No directory".to_string()),
+            },
+        };
+
+        let (label, output) = if import {
+            self.apply_outcome(CommandOutcome::Notice(format!(
+                "Running chira md import {target_dir}..."
+            )));
+            let output = ProcessCommand::new("chira")
+                .arg("md")
+                .arg("import")
+                .arg(&target_dir)
+                .output();
+            ("chira md import", output)
+        } else {
+            self.apply_outcome(CommandOutcome::Notice(format!(
+                "Running chira md {target_dir}..."
+            )));
+            let output = ProcessCommand::new("chira")
+                .arg("md")
+                .arg(&target_dir)
+                .output();
+            ("chira md", output)
+        };
+
+        let out = match output {
+            Ok(out) => out,
+            Err(e) => return CommandOutcome::Failure(format!("failed to run chira: {e}")),
+        };
+        if !import {
+            self.refresh_file_list();
+        }
+        if out.status.success() {
+            CommandOutcome::Notice(format!("{label} completed"))
+        } else {
+            let err_msg = String::from_utf8_lossy(&out.stderr);
+            CommandOutcome::Failure(format!("{} failed: {}", label, err_msg.trim()))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn app_with(label: &str, content: &str) -> (App, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("rum-test-{}-{}", std::process::id(), label));
+        let _ = fs::remove_dir_all(&dir);
+        let mut app = App::new(Source::Dir(dir.clone()), dir.clone()).expect("app created");
+        app.buffer = TextBuffer::from_string(content);
+        app.doc.modified = false;
+        (app, dir)
+    }
+
+    #[test]
+    fn test_insert_mode_without_edit_consumes_no_undo_step() {
+        let (mut app, dir) = app_with("insert-no-edit", "abc");
+
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_key(key(KeyCode::Esc));
+
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.buffer.to_string(), "abc");
+        assert!(!app.doc.modified);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_insert_mode_without_edit_preserves_redo() {
+        let (mut app, dir) = app_with("insert-preserve-redo", "abc");
+
+        app.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(app.buffer.to_string(), "bc");
+
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.buffer.to_string(), "abc");
+
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_key(key(KeyCode::Esc));
+
+        app.handle_key(ctrl('r'));
+        assert_eq!(app.buffer.to_string(), "bc");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_each_insert_session_is_one_undo_step() {
+        let (mut app, dir) = app_with("insert-sessions", "abc");
+
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_key(key(KeyCode::Char('X')));
+        app.handle_key(key(KeyCode::Esc));
+
+        app.handle_key(key(KeyCode::Char('i')));
+        app.handle_key(key(KeyCode::Char('Y')));
+        app.handle_key(key(KeyCode::Esc));
+
+        assert_eq!(app.buffer.to_string(), "XYabc");
+
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.buffer.to_string(), "Xabc");
+
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.buffer.to_string(), "abc");
+
+        assert!(!app.buffer.undo());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_visual_mode_switch_preserves_undo_history() {
+        let (mut app, dir) = app_with("visual-preserve", "abc");
+
+        app.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(app.buffer.to_string(), "bc");
+
+        app.handle_key(key(KeyCode::Char('v')));
+        app.handle_key(key(KeyCode::Char('l')));
+        app.handle_key(key(KeyCode::Esc));
+
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.buffer.to_string(), "abc");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_visual_delete_is_one_undo_step() {
+        let (mut app, dir) = app_with("visual-delete", "abc");
+
+        app.handle_key(key(KeyCode::Char('v')));
+        app.handle_key(key(KeyCode::Char('l')));
+        app.handle_key(key(KeyCode::Char('d')));
+        assert_eq!(app.buffer.to_string(), "c");
+
+        app.handle_key(key(KeyCode::Char('u')));
+        assert_eq!(app.buffer.to_string(), "abc");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn status(app: &App) -> &str {
+        app.status_message.as_deref().unwrap_or("")
+    }
+
+    fn app_in_db(label: &str) -> (App, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("rum-test-{}-{}", std::process::id(), label));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        let db_path = dir.join("ura.db");
+        let conn = Connection::open(&db_path).expect("db created");
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS notes (\
+             id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', \
+             content TEXT NOT NULL DEFAULT '', updatedAt INTEGER NOT NULL DEFAULT 0)",
+            rusqlite::params![],
+        )
+        .expect("schema");
+        conn.execute(
+            "INSERT INTO notes (id, title, content, updatedAt) VALUES ('n1', 'first', 'one', 1)",
+            rusqlite::params![],
+        )
+        .expect("seed");
+        drop(conn);
+
+        let mut app = App::new(Source::Db(db_path), dir.clone()).expect("app created");
+        app.doc.modified = false;
+        (app, dir)
+    }
+
+    #[test]
+    fn test_execute_command_always_returns_to_normal_mode() {
+        let (mut app, dir) = app_with("cmd-mode-normal", "abc");
+        app.doc.modified = true;
+
+        app.mode = Mode::Command;
+        app.execute_command("q");
+        assert_eq!(app.mode, Mode::Normal);
+        assert!(!app.should_quit);
+
+        app.mode = Mode::Command;
+        app.execute_command("");
+        assert_eq!(app.mode, Mode::Normal);
+
+        app.mode = Mode::Command;
+        app.execute_command("nosuch");
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(status(&app), "Unknown command: nosuch");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_save_failure_is_reported_and_written_file_is_not() {
+        let (mut app, dir) = app_with("cmd-save-failure", "abc");
+        let blocker = dir.join("blocker");
+        fs::write(&blocker, "x").expect("blocker");
+
+        app.doc.modified = true;
+        app.execute_command(&format!("w {}", blocker.join("note.md").display()));
+
+        assert_eq!(status(&app).starts_with("Error: "), true, "{}", status(&app));
+        assert!(!status(&app).contains("written"), "{}", status(&app));
+        assert!(!blocker.join("note.md").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_quit_saves_before_quitting() {
+        let (mut app, dir) = app_with("cmd-wq", "abc");
+        app.doc.modified = true;
+        let target = dir.join("out.md");
+
+        app.execute_command(&format!("wq {}", target.display()));
+
+        assert!(app.should_quit);
+        assert!(fs::read_to_string(&target).expect("saved").contains("abc"));
+        assert!(status(&app).ends_with("written"), "{}", status(&app));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_modified_buffer_blocks_source_switch_and_navigation() {
+        let (mut app, dir) = app_with("cmd-guard", "abc");
+        let original_source = app.source.clone();
+        app.doc.modified = true;
+
+        app.execute_command(&format!(
+            "db {}",
+            dir.join("nonexistent-rum-test.db").display()
+        ));
+        assert_eq!(status(&app), "No write since last change (save or discard first)");
+        assert_eq!(app.source, original_source);
+
+        app.execute_command(&format!(
+            "dir {}",
+            dir.join("nonexistent-rum-test-dir").display()
+        ));
+        assert_eq!(status(&app), "No write since last change (save or discard first)");
+        assert_eq!(app.source, original_source);
+
+        app.execute_command("next");
+        assert_eq!(status(&app), "No write since last change (save or discard first)");
+
+        app.execute_command("prev");
+        assert_eq!(status(&app), "No write since last change (save or discard first)");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_failed_db_switch_keeps_previous_source_and_reports_error() {
+        let (mut app, dir) = app_with("cmd-db-failure", "abc");
+        let blocker = dir.join("blocker");
+        fs::write(&blocker, "x").expect("blocker");
+        let original_source = app.source.clone();
+
+        app.execute_command(&format!("db {}", blocker.join("ura.db").display()));
+
+        assert!(status(&app).starts_with("Error: "), "{}", status(&app));
+        assert!(!status(&app).contains("db -> "), "{}", status(&app));
+        assert_eq!(app.source, original_source);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_failed_dir_switch_keeps_previous_source_and_reports_error() {
+        let (mut app, dir) = app_with("cmd-dir-failure", "abc");
+        let blocker = dir.join("blocker");
+        fs::write(&blocker, "x").expect("blocker");
+        let original_source = app.source.clone();
+        let original_root = app.root_dir.clone();
+
+        app.execute_command(&format!("dir {}", blocker.join("sub").display()));
+
+        assert!(status(&app).starts_with("Error: "), "{}", status(&app));
+        assert!(!status(&app).contains("dir -> "), "{}", status(&app));
+        assert_eq!(app.source, original_source);
+        assert_eq!(app.root_dir, original_root);
+        assert!(!blocker.join("sub").exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_db_switch_loads_notes() {
+        let (mut app, dir) = app_in_db("cmd-db-switch");
+        let db_path = match &app.source {
+            Source::Db(p) => p.clone(),
+            Source::Dir(_) => unreachable!("db app"),
+        };
+
+        app.execute_command(&format!("db {}", db_path.display()));
+
+        assert!(status(&app).starts_with("db -> "), "{}", status(&app));
+        assert_eq!(app.notes.len(), 1);
+        assert_eq!(app.buffer.to_string(), "one");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_next_on_empty_list_reports_no_files() {
+        let (mut app, dir) = app_with("cmd-next-empty", "abc");
+        app.files.clear();
+        app.buffer = TextBuffer::from_string("abc");
+
+        app.execute_command("next");
+
+        assert_eq!(status(&app), "No files");
+        assert_eq!(app.buffer.to_string(), "abc");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_usage_messages_leave_state_untouched() {
+        let (mut app, dir) = app_with("cmd-usage", "abc");
+        let original_source = app.source.clone();
+
+        app.execute_command("db");
+        assert_eq!(status(&app), "usage: :db <path>");
+
+        app.execute_command("dir");
+        assert_eq!(status(&app), "usage: :dir <path>");
+
+        app.execute_command("e");
+        assert_eq!(status(&app), "Argument required for :e");
+
+        app.execute_command("e!");
+        assert_eq!(status(&app), "No file name");
+
+        assert_eq!(app.source, original_source);
+        assert_eq!(app.buffer.to_string(), "abc");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reload_failure_reports_error_instead_of_reloaded() {
+        let (mut app, dir) = app_with("cmd-reload-failure", "abc");
+        let blocker = dir.join("blocker");
+        fs::write(&blocker, "x").expect("blocker");
+        app.doc.path = Some(blocker.join("note.md"));
+
+        app.execute_command("e!");
+
+        assert!(status(&app).starts_with("Error: "), "{}", status(&app));
+        assert!(!status(&app).contains("Reloaded"), "{}", status(&app));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reload_success_reports_reloaded() {
+        let (mut app, dir) = app_with("cmd-reload-ok", "abc");
+        let target = dir.join("note.md");
+        fs::write(&target, "on disk").expect("write");
+        app.doc.path = Some(target.clone());
+        app.doc.modified = true;
+        app.buffer = TextBuffer::from_string("edited");
+
+        app.execute_command("e!");
+
+        assert_eq!(status(&app), "Reloaded");
+        assert_eq!(app.buffer.to_string(), "on disk");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ctrl_p_obeys_unsaved_guard() {
+        let (mut app, dir) = app_with("cmd-ctrl-p-guard", "abc");
+        fs::write(dir.join("a.md"), "a").expect("a");
+        fs::write(dir.join("b.md"), "b").expect("b");
+        app.refresh_file_list();
+        app.open_file_at_index(0).expect("open");
+        app.doc.modified = true;
+
+        app.handle_key(ctrl('p'));
+
+        assert_eq!(status(&app), "No write since last change (save or discard first)");
+        assert_eq!(app.buffer.to_string(), "a");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_unknown_command_reports_message() {
+        let (mut app, dir) = app_with("cmd-unknown", "abc");
+
+        app.execute_command("frobnicate");
+
+        assert_eq!(status(&app), "Unknown command: frobnicate");
+        assert!(!app.should_quit);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_save_success_reports_written() {
+        let (mut app, dir) = app_with("cmd-save-ok", "abc");
+        app.doc.modified = true;
+
+        app.execute_command("w");
+
+        assert!(status(&app).ends_with("written"), "{}", status(&app));
+        assert!(!status(&app).starts_with("Error: "), "{}", status(&app));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_new_txt_path_gets_no_front_matter() {
+        let (mut app, dir) = app_with("fm-new-txt", "");
+        let target = dir.join("note.txt");
+
+        app.execute_command(&format!("e {}", target.display()));
+
+        assert!(app.doc.front_matter.is_none());
+        app.buffer = TextBuffer::from_string("plain body\nsecond line");
+        app.doc.modified = true;
+        app.execute_command("w");
+
+        let written = fs::read_to_string(&target).expect("txt written");
+        assert!(!written.contains("---"), "{written}");
+        assert!(!written.contains("id: "), "{written}");
+        assert!(!written.contains("title: "), "{written}");
+        assert!(!written.contains("updatedAt: "), "{written}");
+        assert_eq!(written, "plain body\nsecond line");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_new_md_path_gets_front_matter() {
+        let (mut app, dir) = app_with("fm-new-md", "");
+        let target = dir.join("note.md");
+
+        app.execute_command(&format!("e {}", target.display()));
+
+        assert!(app.doc.front_matter.is_some());
+        app.buffer = TextBuffer::from_string("heading\n");
+        app.doc.modified = true;
+        app.execute_command("w");
+
+        let written = fs::read_to_string(&target).expect("md written");
+        assert!(written.starts_with("---\n"), "{written}");
+        assert!(written.contains("id: note-"), "{written}");
+        assert!(written.contains("title: heading"), "{written}");
+        assert!(written.contains("updatedAt: "), "{written}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_to_txt_path_omits_front_matter_of_markdown_document() {
+        let (mut app, dir) = app_with("fm-write-txt", "");
+        let source = dir.join("note.md");
+        app.execute_command(&format!("e {}", source.display()));
+        assert!(app.doc.front_matter.is_some());
+        app.buffer = TextBuffer::from_string("body text");
+        app.doc.modified = true;
+
+        let target = dir.join("out.txt");
+        app.execute_command(&format!("w {}", target.display()));
+
+        assert_eq!(
+            fs::read_to_string(&target).expect("txt written"),
+            "body text"
+        );
+
+        app.doc.modified = true;
+        app.execute_command("w");
+
+        assert_eq!(
+            fs::read_to_string(&target).expect("txt rewritten"),
+            "body text"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_to_md_path_adds_front_matter() {
+        let (mut app, dir) = app_with("fm-write-md", "body");
+        let plain = dir.join("seed.txt");
+        fs::write(&plain, "body").expect("seed");
+        app.execute_command(&format!("e {}", plain.display()));
+        assert!(app.doc.front_matter.is_none());
+
+        let target = dir.join("out.md");
+        app.doc.modified = true;
+        app.execute_command(&format!("w {}", target.display()));
+
+        let written = fs::read_to_string(&target).expect("md written");
+        assert!(written.starts_with("---\n"), "{written}");
+        assert!(written.contains("id: note-"), "{written}");
+        assert!(written.contains("title: body"), "{written}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_plain_txt_stays_plain_across_open_save_reload() {
+        let (mut app, dir) = app_with("fm-txt-roundtrip", "");
+        let target = dir.join("plain.txt");
+        fs::write(&target, "plain text note\nsecond line").expect("seed");
+
+        app.execute_command(&format!("e {}", target.display()));
+        assert!(app.doc.front_matter.is_none());
+
+        app.buffer = TextBuffer::from_string("edited body\n");
+        app.doc.modified = true;
+        app.execute_command("w");
+        assert!(app.doc.front_matter.is_none());
+        assert_eq!(
+            fs::read_to_string(&target).expect("txt saved"),
+            "edited body\n"
+        );
+
+        app.execute_command("e!");
+        assert!(app.doc.front_matter.is_none());
+        assert_eq!(app.buffer.to_string(), "edited body\n");
+        assert_eq!(
+            fs::read_to_string(&target).expect("txt reloaded"),
+            "edited body\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_new_note_keeps_front_matter() {
+        let (mut app, dir) = app_with("fm-new-note", "abc");
+
+        app.execute_command("new");
+
+        assert!(app.doc.front_matter.is_some());
+        assert!(app.doc.path.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_uppercase_md_keeps_front_matter_on_save() {
+        let (mut app, dir) = app_with("fm-uppercase-md", "");
+        let target = dir.join("note.MD");
+        fs::write(
+            &target,
+            "---\nid: note-1\ntitle: T\nupdatedAt: 1\n---\nbody\n",
+        )
+        .expect("seed");
+
+        app.execute_command(&format!("e {}", target.display()));
+        assert!(app.doc.front_matter.is_some());
+        app.buffer = TextBuffer::from_string("edited body\n");
+        app.doc.modified = true;
+        app.execute_command("w");
+
+        let written = fs::read_to_string(&target).expect("md written");
+        assert!(written.starts_with("---\n"), "{written}");
+        assert!(written.contains("id: note-1"), "{written}");
+        assert!(written.contains("title: edited body"), "{written}");
+        assert!(written.contains("updatedAt: "), "{written}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_plain_md_stays_plain_on_no_argument_save() {
+        let (mut app, dir) = app_with("fm-plain-md", "");
+        let target = dir.join("plain.md");
+        fs::write(&target, "body").expect("seed");
+
+        app.execute_command(&format!("e {}", target.display()));
+        assert!(app.doc.front_matter.is_none());
+
+        app.buffer = TextBuffer::from_string("edited body\n");
+        app.doc.modified = true;
+        app.execute_command("w");
+        assert_eq!(
+            fs::read_to_string(&target).expect("md saved"),
+            "edited body\n"
+        );
+
+        app.buffer = TextBuffer::from_string("edited again\n");
+        app.doc.modified = true;
+        app.handle_key(ctrl('s'));
+        assert_eq!(
+            fs::read_to_string(&target).expect("md saved again"),
+            "edited again\n"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_to_uppercase_txt_path_stays_plain() {
+        let (mut app, dir) = app_with("fm-write-upper-txt", "");
+        let source = dir.join("note.md");
+        app.execute_command(&format!("e {}", source.display()));
+        assert!(app.doc.front_matter.is_some());
+        app.buffer = TextBuffer::from_string("body text");
+        app.doc.modified = true;
+
+        let target = dir.join("out.TXT");
+        app.execute_command(&format!("w {}", target.display()));
+        assert_eq!(
+            fs::read_to_string(&target).expect("txt written"),
+            "body text"
+        );
+
+        app.execute_command("w");
+        assert_eq!(
+            fs::read_to_string(&target).expect("txt rewritten"),
+            "body text"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_db_note_written_to_txt_path_stays_plain() {
+        let (mut app, dir) = app_in_db("fm-db-write-txt");
+        app.buffer = TextBuffer::from_string("one edited");
+        app.doc.modified = true;
+
+        app.execute_command("w out.txt");
+
+        assert_eq!(fs::read_to_string(dir.join("out.txt")).expect("txt"), "one edited");
+
+        let conn = Connection::open(dir.join("ura.db")).expect("db");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM notes",
+                rusqlite::params![],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(count, 1);
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM notes WHERE id = 'n1'",
+                rusqlite::params![],
+                |r| r.get(0),
+            )
+            .expect("content");
+        assert_eq!(content, "one edited");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
