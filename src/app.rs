@@ -220,6 +220,8 @@ impl App {
                 }
             }
         }
+    }
+
     /// Retrieve or open a cached database connection for the given path, configuring busy timeout and WAL mode.
     pub fn get_db_connection(&mut self, path: &Path) -> rusqlite::Result<&mut Connection> {
         let same_path = self.db_conn_path.as_deref() == Some(path);
