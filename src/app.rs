@@ -1778,6 +1778,8 @@ mod tests {
     #[test]
     fn next_propagates_error_when_db_is_removed() {
         let (mut app, db_path) = make_app_with_db_notes();
+        // cached connection を解放してから削除（Windows では open 中の削除はブロックされる）
+        app.reset_db_connection();
         fs::remove_file(&db_path).unwrap();
         app.execute_command("next");
         let msg = app.status_message.as_ref().unwrap();
