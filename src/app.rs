@@ -1008,6 +1008,13 @@ impl App {
                 let Some(cur_path) = self.doc.path.clone() else {
                     return CommandOutcome::Notice("No file name".to_string());
                 };
+                // 再読み込み（e!）は disk 上の現物を読み直す。無ければ新規作成せずエラー。
+                if !cur_path.exists() {
+                    return CommandOutcome::Failure(format!(
+                        "No such file: {}",
+                        cur_path.file_name().unwrap().to_string_lossy()
+                    ));
+                }
                 match self.open_file_path(cur_path) {
                     Ok(()) => CommandOutcome::Notice("Reloaded".to_string()),
                     Err(e) => CommandOutcome::Failure(e.to_string()),
