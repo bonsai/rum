@@ -218,7 +218,7 @@ impl App {
                 rusqlite::params![&entry.id],
                 |r| r.get(0),
             )
-            .unwrap_or_default();
+            .map_err(|e| e.to_string())?;
         self.buffer = TextBuffer::from_string(&content);
         self.doc = Document {
             path: None,
@@ -972,9 +972,16 @@ impl App {
 
     fn cmd_db(&mut self, arg: Option<&str>) -> Result<String, String> {
         let p = arg.ok_or_else(|| "usage: :db <path>".to_string())?;
-        let path = crate::config::expand(p);
+        let mut path = crate::config::expand(p);
+        // 相対パスは現在の root_dir 基準。
+        if path.is_relative() {
+            path = self.root_dir.join(path);
+        }
         if !crate::config::validate_path(&path) {
             return Err(format!("Invalid path: {}", p));
+        }
+        if !path.exists() {
+            return Err(format!("db not found: {}", path.display()));
         }
         let notes = Self::load_notes(&path).map_err(|e| e.to_string())?;
         self.source = Source::Db(path.clone());
@@ -989,7 +996,11 @@ impl App {
 
     fn cmd_dir(&mut self, arg: Option<&str>) -> Result<String, String> {
         let p = arg.ok_or_else(|| "usage: :dir <path>".to_string())?;
-        let path = crate::config::expand(p);
+        let mut path = crate::config::expand(p);
+        // 相対パスは現在の root_dir 基準。
+        if path.is_relative() {
+            path = self.root_dir.join(path);
+        }
         if !crate::config::validate_path(&path) {
             return Err(format!("Invalid path: {}", p));
         }
@@ -1289,7 +1300,8 @@ mod tests {
         app.execute_command("e existing.md");
         let msg = app.status_message.as_ref().unwrap();
         assert!(msg.contains("add ! to override"));
-        assert_eq!(app.doc.body, "changed");
+        // buffer は変化せず（save 時に doc.body へ同期されるアーキテクチャ）
+        assert_eq!(app.buffer.to_string(), "changed");
     }
 
     #[test]
@@ -1337,7 +1349,7 @@ mod tests {
         app.execute_command("new");
         let msg = app.status_message.as_ref().unwrap();
         assert!(msg.contains("save or discard first"));
-        assert_eq!(app.doc.body, "changed");
+        assert_eq!(app.buffer.to_string(), "changed");
     }
 
     #[test]
