@@ -948,6 +948,13 @@ impl App {
         if let Some(path) = arg {
             self.open_file_path(path)
         } else if let Some(cur_path) = self.doc.path.clone() {
+            // 再読み込み（e!）は disk 上の現物を読み直す。無ければ新規作成せずエラー。
+            if !cur_path.exists() {
+                return Err(format!(
+                    "No such file: {}",
+                    cur_path.file_name().unwrap().to_string_lossy()
+                ));
+            }
             self.open_file_path(cur_path)?;
             Ok("Reloaded".to_string())
         } else {
