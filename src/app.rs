@@ -4,11 +4,42 @@ use crate::doc::{derive_title, generate_note_id, Document, FrontMatter};
 use anyhow::Result;
 use chrono::Utc;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use rusqlite::Connection;
+use rusqlite::{Connection, ErrorCode};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::thread;
+use std::time::Duration;
+
+/// Helper to check if a rusqlite Error represents a lock or busy condition.
+pub fn is_sqlite_locked_or_busy(err: &rusqlite::Error) -> bool {
+    match err {
+        rusqlite::Error::SqliteFailure(ffi_err, _) => {
+            ffi_err.code == ErrorCode::DatabaseLocked || ffi_err.code == ErrorCode::DatabaseBusy
+        }
+        _ => false,
+    }
+}
+
+/// Generic retry helper with exponential backoff for SQLite operations experiencing lock contention.
+pub fn retry_on_lock<T, F: FnMut() -> rusqlite::Result<T>>(mut op: F) -> rusqlite::Result<T> {
+    let mut delay = Duration::from_millis(10);
+    let max_delay = Duration::from_millis(200);
+    let max_retries = 5;
+
+    for attempt in 0..=max_retries {
+        match op() {
+            Ok(val) => return Ok(val),
+            Err(err) if is_sqlite_locked_or_busy(&err) && attempt < max_retries => {
+                thread::sleep(delay);
+                delay = (delay * 2).min(max_delay);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!()
+}
 
 /// 読み込み元。db = chira-ura の SQLite、dir = md/txt ディレクトリ。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +116,10 @@ pub struct App {
     pub focused_pane: Pane,
     pub ura_enabled: bool,
     pub prev_doc_lines: Option<Vec<String>>,
+    /// Cached SQLite connection for DB mode
+    pub db_conn: Option<Connection>,
+    /// Path of the currently cached SQLite connection
+    pub db_conn_path: Option<PathBuf>,
 }
 
 impl App {
@@ -132,6 +167,8 @@ impl App {
             viewport_top: 0,
             ura_enabled: true,
             prev_doc_lines: None,
+            db_conn: None,
+            db_conn_path: None,
         };
 
         // BOX のインデックスを現在の source と一致させる
@@ -183,6 +220,32 @@ impl App {
                 }
             }
         }
+    /// Retrieve or open a cached database connection for the given path, configuring busy timeout and WAL mode.
+    pub fn get_db_connection(&mut self, path: &Path) -> rusqlite::Result<&mut Connection> {
+        let same_path = self.db_conn_path.as_deref() == Some(path);
+        if !same_path || self.db_conn.is_none() {
+            self.db_conn = None;
+            self.db_conn_path = None;
+
+            let path_buf = path.to_path_buf();
+            let conn = retry_on_lock(|| {
+                let conn = Connection::open(&path_buf)?;
+                conn.busy_timeout(Duration::from_millis(5000))?;
+                let _ = conn.pragma_update(None, "journal_mode", "WAL");
+                Ok(conn)
+            })?;
+
+            self.db_conn = Some(conn);
+            self.db_conn_path = Some(path.to_path_buf());
+        }
+
+        Ok(self.db_conn.as_mut().expect("db_conn must be present"))
+    }
+
+    /// Reset cached DB connection (e.g. when switching database source)
+    pub fn reset_db_connection(&mut self) {
+        self.db_conn = None;
+        self.db_conn_path = None;
     }
 
     /// 読み込み元に応じて一覧を取り直す
@@ -263,8 +326,38 @@ impl App {
             _ => None,
         };
         if let Some(path) = db_path {
-            match Self::load_notes(&path) {
-                Ok(notes) => self.notes = notes,
+            // PR #10: キャッシュ接続 + SQLITE_BUSY 時は指数バックオフでリトライ。
+            let res = (|| -> rusqlite::Result<Vec<NoteEntry>> {
+                let conn = self.get_db_connection(&path)?;
+                retry_on_lock(|| {
+                    conn.execute(
+                        "CREATE TABLE IF NOT EXISTS notes (\
+                         id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', \
+                         content TEXT NOT NULL DEFAULT '', updatedAt INTEGER NOT NULL DEFAULT 0)",
+                        rusqlite::params![],
+                    )?;
+                    let mut stmt = conn.prepare(
+                        "SELECT id, title, updatedAt FROM notes ORDER BY updatedAt DESC, id DESC",
+                    )?;
+                    let rows = stmt.query_map(rusqlite::params![], |r| {
+                        Ok(NoteEntry {
+                            id: r.get(0)?,
+                            title: r.get(1)?,
+                            updated_at: r.get(2)?,
+                        })
+                    })?;
+                    let mut entries = Vec::new();
+                    for n in rows {
+                        entries.push(n?);
+                    }
+                    Ok(entries)
+                })
+            })();
+
+            match res {
+                Ok(entries) => {
+                    self.notes = entries;
+                }
                 Err(e) => {
                     self.status_message = Some(format!("db open failed: {}: {e}", path.display()));
                 }
@@ -285,14 +378,18 @@ impl App {
             Source::Db(p) => p.clone(),
             _ => return Err("not in db mode".to_string()),
         };
-        let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
-        let content: String = conn
-            .query_row(
-                "SELECT content FROM notes WHERE id = ?1",
-                rusqlite::params![&entry.id],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
+        // PR #10: キャッシュ接続 + SQLITE_BUSY リトライで本文を読む。
+        let content = (|| -> rusqlite::Result<String> {
+            let conn = self.get_db_connection(&db_path)?;
+            retry_on_lock(|| {
+                conn.query_row(
+                    "SELECT content FROM notes WHERE id = ?1",
+                    rusqlite::params![&entry.id],
+                    |r| r.get(0),
+                )
+            })
+        })()
+        .map_err(|e| e.to_string())?;
         self.buffer = TextBuffer::from_string(&content);
         self.doc = Document {
             path: None,
@@ -333,13 +430,19 @@ impl App {
             Source::Db(p) => p.clone(),
             _ => return Err("not in db mode".to_string()),
         };
-        let conn = Connection::open(&db_path).map_err(|e| e.to_string())?;
-        conn.execute(
-            "INSERT INTO notes (id, title, content, updatedAt) VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT(id) DO UPDATE SET title = excluded.title, \
-             content = excluded.content, updatedAt = excluded.updatedAt",
-            rusqlite::params![id, title, body, now],
-        )
+        // PR #10: upsert を Transaction で原子的に実行し、BUSY は指数バックオフでリトライする。
+        let conn = self.get_db_connection(&db_path).map_err(|e| e.to_string())?;
+        retry_on_lock(|| {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT INTO notes (id, title, content, updatedAt) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(id) DO UPDATE SET title = excluded.title, \
+                 content = excluded.content, updatedAt = excluded.updatedAt",
+                rusqlite::params![&id, &title, &body, now],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
         .map_err(|e| e.to_string())?;
         self.doc.modified = false;
         self.refresh_notes();
@@ -1179,6 +1282,8 @@ impl App {
         if !path.exists() {
             return Err(format!("db not found: {}", path.display()));
         }
+        // PR #10: DB を差し替える前にキャッシュ接続を破棄する（旧 DB のロック/WAL を解放）。
+        self.reset_db_connection();
         let notes = Self::load_notes(&path).map_err(|e| e.to_string())?;
         self.source = Source::Db(path.clone());
         self.notes = notes;
@@ -1354,8 +1459,10 @@ impl App {
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1917,6 +2024,8 @@ mod tests {
     #[test]
     fn next_propagates_error_when_db_is_removed() {
         let (mut app, db_path) = make_app_with_db_notes();
+        // cached connection を解放してから削除（Windows では open 中の削除はブロックされる）
+        app.reset_db_connection();
         fs::remove_file(&db_path).unwrap();
         app.execute_command("next");
         let msg = app.status_message.as_ref().unwrap();
@@ -1960,6 +2069,136 @@ mod tests {
         app.execute_command("set ura");
         assert!(app.ura_enabled);
         let _ = fs::remove_dir_all(dir);
+    #[test]
+    fn test_db_save_note_transaction_atomicity() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "rum_test_atomicity_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let db_path = temp_dir.join("test.db");
+
+        let mut app = App::new(Source::Db(db_path.clone()), temp_dir.clone()).unwrap();
+        app.buffer = TextBuffer::from_string("# Test Note\nHello World");
+        app.save_current_file(None).unwrap();
+
+        assert_eq!(app.notes.len(), 1);
+        assert_eq!(app.notes[0].title, "# Test Note");
+
+        // Verify direct DB query shows committed data
+        let conn = Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM notes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let content: String = conn
+            .query_row(
+                "SELECT content FROM notes WHERE id = ?1",
+                [&app.notes[0].id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "# Test Note\nHello World");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_db_connection_reuse() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "rum_test_reuse_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let db_path = temp_dir.join("test.db");
+
+        let mut app = App::new(Source::Db(db_path.clone()), temp_dir.clone()).unwrap();
+        assert!(app.db_conn.is_some());
+        assert_eq!(app.db_conn_path.as_deref(), Some(db_path.as_path()));
+
+        // Perform multiple saves and reads
+        app.buffer = TextBuffer::from_string("# First Note\nBody 1");
+        app.save_current_file(None).unwrap();
+
+        // Ensure distinct millisecond timestamp for generated note ID
+        thread::sleep(Duration::from_millis(10));
+
+        app.new_note();
+        app.buffer = TextBuffer::from_string("# Second Note\nBody 2");
+        app.save_current_file(None).unwrap();
+
+        assert_eq!(app.notes.len(), 2);
+        // Connection is still cached
+        assert!(app.db_conn.is_some());
+        assert_eq!(app.db_conn_path.as_deref(), Some(db_path.as_path()));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_db_retry_on_lock_contention() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "rum_test_lock_{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let db_path = temp_dir.join("test.db");
+
+        // Initialize table
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS notes (\
+                 id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', \
+                 content TEXT NOT NULL DEFAULT '', updatedAt INTEGER NOT NULL DEFAULT 0)",
+                rusqlite::params![],
+            )
+            .unwrap();
+        }
+
+        let locked = Arc::new(AtomicBool::new(false));
+        let locked_clone = locked.clone();
+        let path_clone = db_path.clone();
+
+        // Spawn a thread that holds an EXCLUSIVE transaction lock briefly
+        let handle = thread::spawn(move || {
+            let mut conn = Connection::open(&path_clone).unwrap();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)
+                .unwrap();
+            tx.execute("INSERT INTO notes (id, title, content, updatedAt) VALUES ('hold', 'Locked', 'Holding lock', 0)", []).unwrap();
+            locked_clone.store(true, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(50));
+            tx.commit().unwrap();
+        });
+
+        // Wait until lock is acquired by the thread
+        while !locked.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        // Now test retry_on_lock helper with an operation that attempts an exclusive transaction
+        let mut conn2 = Connection::open(&db_path).unwrap();
+        conn2.busy_timeout(Duration::from_millis(10)).unwrap();
+
+        let retry_result = retry_on_lock(|| {
+            let tx = conn2.transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)?;
+            tx.execute("INSERT INTO notes (id, title, content, updatedAt) VALUES ('test2', 'Retry', 'Worked', 1)", [])?;
+            tx.commit()?;
+            Ok(())
+        });
+
+        handle.join().unwrap();
+        assert!(retry_result.is_ok());
+
+        let count: i64 = conn2
+            .query_row("SELECT count(*) FROM notes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
+
 
