@@ -27,6 +27,8 @@ pub struct TextBuffer {
     pub cursor: Position,
     history: Vec<HistoryState>,
     redo_stack: Vec<HistoryState>,
+    /// Snapshot armed by `snapshot()` and recorded only once the session edits.
+    pending: Option<HistoryState>,
     pub clipboard: Option<ClipboardContent>,
 }
 
@@ -43,6 +45,7 @@ impl TextBuffer {
             cursor: Position { row: 0, col: 0 },
             history: Vec::new(),
             redo_stack: Vec::new(),
+            pending: None,
             clipboard: None,
         }
     }
@@ -60,6 +63,7 @@ impl TextBuffer {
             cursor: Position { row: 0, col: 0 },
             history: Vec::new(),
             redo_stack: Vec::new(),
+            pending: None,
             clipboard: None,
         }
     }
@@ -76,18 +80,29 @@ impl TextBuffer {
         self.lines.len()
     }
 
+    /// Arms a snapshot for the edit session that follows.
+    /// The snapshot is recorded only when the session actually mutates text, so entering a
+    /// mode (or any other non-mutating operation) neither consumes an undo step nor clears redo.
     pub fn snapshot(&mut self) {
-        self.history.push(HistoryState {
+        self.pending = Some(HistoryState {
             lines: self.lines.clone(),
             cursor: self.cursor,
         });
-        self.redo_stack.clear();
-        if self.history.len() > 200 {
-            self.history.remove(0);
+    }
+
+    /// Records the armed snapshot as an undo step. Call once per mutating operation.
+    pub fn commit_edit(&mut self) {
+        if let Some(state) = self.pending.take() {
+            self.history.push(state);
+            self.redo_stack.clear();
+            if self.history.len() > 200 {
+                self.history.remove(0);
+            }
         }
     }
 
     pub fn undo(&mut self) -> bool {
+        self.pending = None;
         if let Some(prev) = self.history.pop() {
             self.redo_stack.push(HistoryState {
                 lines: self.lines.clone(),
@@ -103,6 +118,7 @@ impl TextBuffer {
     }
 
     pub fn redo(&mut self) -> bool {
+        self.pending = None;
         if let Some(next) = self.redo_stack.pop() {
             self.history.push(HistoryState {
                 lines: self.lines.clone(),
@@ -316,6 +332,7 @@ impl TextBuffer {
     // --- Insert & editing operations ---
 
     pub fn insert_char(&mut self, c: char) {
+        self.commit_edit();
         let line = &mut self.lines[self.cursor.row];
         let mut chars: Vec<char> = line.chars().collect();
         if self.cursor.col > chars.len() {
@@ -331,6 +348,7 @@ impl TextBuffer {
         if self.lines.len() >= MAX_SHEET_LINES {
             return;
         }
+        self.commit_edit();
         let line = &self.lines[self.cursor.row];
         let chars: Vec<char> = line.chars().collect();
         let col = self.cursor.col.min(chars.len());
@@ -346,6 +364,7 @@ impl TextBuffer {
 
     pub fn delete_char_before_cursor(&mut self) {
         if self.cursor.col > 0 {
+            self.commit_edit();
             let line = &mut self.lines[self.cursor.row];
             let mut chars: Vec<char> = line.chars().collect();
             chars.remove(self.cursor.col - 1);
@@ -353,6 +372,7 @@ impl TextBuffer {
             self.cursor.col -= 1;
         } else if self.cursor.row > 0 {
             // Join with previous line
+            self.commit_edit();
             let current = self.lines.remove(self.cursor.row);
             self.cursor.row -= 1;
             let prev_len = self.lines[self.cursor.row].chars().count();
@@ -362,22 +382,20 @@ impl TextBuffer {
     }
 
     pub fn delete_char_under_cursor(&mut self) -> Option<char> {
-        let line = &mut self.lines[self.cursor.row];
-        let mut chars: Vec<char> = line.chars().collect();
-        if chars.is_empty() {
+        if self.cursor.col >= self.lines[self.cursor.row].chars().count() {
             return None;
         }
-        if self.cursor.col < chars.len() {
-            let removed = chars.remove(self.cursor.col);
-            *line = chars.into_iter().collect();
-            self.clamp_cursor(false);
-            Some(removed)
-        } else {
-            None
-        }
+        self.commit_edit();
+        let line = &mut self.lines[self.cursor.row];
+        let mut chars: Vec<char> = line.chars().collect();
+        let removed = chars.remove(self.cursor.col);
+        *line = chars.into_iter().collect();
+        self.clamp_cursor(false);
+        Some(removed)
     }
 
     pub fn delete_line(&mut self) -> String {
+        self.commit_edit();
         if self.lines.len() <= 1 {
             let old = std::mem::take(&mut self.lines[0]);
             self.cursor.col = 0;
@@ -401,6 +419,7 @@ impl TextBuffer {
     }
 
     pub fn paste(&mut self, clip: &ClipboardContent) {
+        self.commit_edit();
         match clip {
             ClipboardContent::Lines(lines) => {
                 // Paste below current line, respecting MAX_SHEET_LINES
@@ -436,6 +455,7 @@ impl TextBuffer {
         if self.lines.len() >= MAX_SHEET_LINES {
             return;
         }
+        self.commit_edit();
         self.lines.insert(self.cursor.row + 1, String::new());
         self.cursor.row += 1;
         self.cursor.col = 0;
@@ -445,6 +465,7 @@ impl TextBuffer {
         if self.lines.len() >= MAX_SHEET_LINES {
             return;
         }
+        self.commit_edit();
         self.lines.insert(self.cursor.row, String::new());
         self.cursor.col = 0;
     }
@@ -548,5 +569,74 @@ mod tests {
         // paste も 24 行を超えない
         buf.paste(&ClipboardContent::Lines(vec!["extra".to_string()]));
         assert_eq!(buf.line_count(), 24);
+    }
+
+    #[test]
+    fn test_unedited_session_records_no_undo_step() {
+        let mut buf = TextBuffer::from_string("abc");
+        buf.snapshot();
+        buf.insert_char('X');
+        assert_eq!(buf.to_string(), "Xabc");
+
+        assert!(buf.undo());
+        assert_eq!(buf.to_string(), "abc");
+
+        // A session that never mutates text leaves the stacks untouched.
+        buf.snapshot();
+        assert!(buf.redo());
+        assert_eq!(buf.to_string(), "Xabc");
+
+        buf.snapshot();
+        assert!(buf.undo());
+        assert_eq!(buf.to_string(), "abc");
+        assert!(!buf.undo());
+    }
+
+    #[test]
+    fn test_undo_drops_uncommitted_session_state() {
+        let mut buf = TextBuffer::from_string("abc");
+        buf.snapshot();
+        buf.insert_char('X');
+        assert_eq!(buf.to_string(), "Xabc");
+
+        assert!(buf.undo());
+        assert_eq!(buf.to_string(), "abc");
+
+        buf.snapshot();
+        assert!(!buf.undo());
+        buf.insert_char('Y');
+        assert_eq!(buf.to_string(), "Yabc");
+        assert!(!buf.undo());
+    }
+
+    #[test]
+    fn test_new_edit_clears_redo() {
+        let mut buf = TextBuffer::from_string("abc");
+        buf.snapshot();
+        buf.insert_char('X');
+        assert_eq!(buf.to_string(), "Xabc");
+
+        assert!(buf.undo());
+        assert_eq!(buf.to_string(), "abc");
+
+        buf.snapshot();
+        buf.insert_char('Y');
+        assert_eq!(buf.to_string(), "Yabc");
+        assert!(!buf.redo());
+    }
+
+    #[test]
+    fn test_history_is_capped_at_200_entries() {
+        let mut buf = TextBuffer::new();
+        for _ in 0..205 {
+            buf.snapshot();
+            buf.insert_char('a');
+        }
+
+        let mut undos = 0;
+        while buf.undo() {
+            undos += 1;
+        }
+        assert_eq!(undos, 200);
     }
 }
