@@ -2069,6 +2069,8 @@ mod tests {
         app.execute_command("set ura");
         assert!(app.ura_enabled);
         let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn test_db_save_note_transaction_atomicity() {
         let temp_dir = std::env::temp_dir().join(format!(
