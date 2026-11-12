@@ -189,7 +189,7 @@ impl App {
             _ => None,
         };
         if let Some(path) = db_path {
-            match load_notes(&path) {
+            match Self::load_notes(&path) {
                 Ok(notes) => self.notes = notes,
                 Err(e) => {
                     self.status_message = Some(format!("db open failed: {}: {e}", path.display()));
@@ -275,7 +275,7 @@ impl App {
     }
 
     pub fn refresh_file_list(&mut self) {
-        self.files = collect_files(&self.root_dir);
+        self.files = Self::collect_files(&self.root_dir);
     }
 
     pub fn open_file_at_index(&mut self, idx: usize) -> Result<String, String> {
@@ -976,7 +976,7 @@ impl App {
         if !crate::config::validate_path(&path) {
             return Err(format!("Invalid path: {}", p));
         }
-        let notes = load_notes(&path).map_err(|e| e.to_string())?;
+        let notes = Self::load_notes(&path).map_err(|e| e.to_string())?;
         self.source = Source::Db(path.clone());
         self.notes = notes;
         if !self.notes.is_empty() {
@@ -999,7 +999,7 @@ impl App {
         if !path.is_dir() {
             return Err(format!("Not a directory: {}", p));
         }
-        let files = collect_files(&path);
+        let files = Self::collect_files(&path);
         self.root_dir = path.clone();
         self.source = Source::Dir(path.clone());
         self.files = files;
@@ -1661,3 +1661,4 @@ mod tests {
         assert!(msg.starts_with("Error:"));
     }
 }
+
