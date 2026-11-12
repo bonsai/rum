@@ -623,6 +623,7 @@ impl App {
 
         match key.code {
             KeyCode::Esc => {
+                self.buffer.snapshot();
                 self.mode = Mode::Normal;
                 self.buffer.clamp_cursor(false);
             }
@@ -657,6 +658,7 @@ impl App {
     fn handle_visual_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
+                self.buffer.snapshot();
                 self.mode = Mode::Normal;
                 self.visual_start = None;
             }
