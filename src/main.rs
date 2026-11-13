@@ -45,7 +45,7 @@ rum — vim 風 TUI リーダ/エディタ
   / pattern, n N                   検索
   :w :q :wq :e :new :next :prev    コマンド
   :db <path> / :dir <path>         読み込み元を切替
-  :md [dir] / :sync [dir]          chira md / chira md import
+  :md [dir] / :sync [dir]          chira md / chira md import（要 cargo install chira-ura）
   Ctrl-s 保存 / Ctrl-p Ctrl-n 前後のノート
 ";
 

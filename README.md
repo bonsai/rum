@@ -111,8 +111,8 @@ boxes:
 - `:next` / `:prev`: 次/前の紙を開く
 - `:set ura` / `:set noura`: 裏写り演出の有効化 / 無効化
 - `:box <name> <db|dir> <path>`: 新規 BOX の追加・設定保存
-- `:md [dir]`: 外部コマンド `chira md [dir]` を実行
-- `:sync [dir]`: 外部コマンド `chira md import [dir]` を実行
+- `:md [dir]`: 外部コマンド `chira md [dir]` を実行（要 `cargo install chira-ura`）
+- `:sync [dir]`: 外部コマンド `chira md import [dir]` を実行（要 `cargo install chira-ura`。未導入時はインストール案内を表示）
 
 未保存の変更がある間は、`:db` / `:dir` / `:new` / `:next` / `:prev` / `:e` はバッファを差し替えず、その理由をメッセージに表示します。`:db` / `:dir` の読み込みに失敗した場合は読み込み元を切り替えません。
 
